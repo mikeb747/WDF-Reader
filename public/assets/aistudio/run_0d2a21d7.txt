@@ -1,0 +1,9 @@
+Import-Module WdfParser -Force
+Get-WdfSpectrum -Path "E:\Powershell\WDF Reader\wdf files\100 cm-1_532 nm_1800 lmm\532nm_1800_10 sec static scan.wdf"
+
+
+
+Remove-Module WdfParser -Force -ErrorAction SilentlyContinue
+Import-Module WdfParser -Force
+
+Get-WdfSpectrum -Path "E:\Powershell\WDF Reader\wdf files\100 cm-1_532 nm_1800 lmm\532nm_1800_10 sec static scan.wdf"

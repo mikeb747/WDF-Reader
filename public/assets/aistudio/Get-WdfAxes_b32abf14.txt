@@ -1,0 +1,67 @@
+param(
+    [Parameter(Mandatory)]
+    [string]$Path
+)
+
+# Read file
+$bytes = [System.IO.File]::ReadAllBytes($Path)
+$offset = 0
+
+# Prepare output file
+$dir  = Split-Path $Path
+$name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+$outFile = Join-Path $dir "$name`_axes.txt"
+
+# Clear old file if it exists
+if (Test-Path $outFile) { Remove-Item $outFile }
+
+Add-Content $outFile "WDF Axes Extract"
+Add-Content $outFile "Source: $Path"
+Add-Content $outFile "----------------------------------------"
+
+while ($offset -lt $bytes.Length) {
+
+    # Read block header
+    $blockId   = [System.BitConverter]::ToUInt32($bytes, $offset)
+    $blockSize = [System.BitConverter]::ToUInt64($bytes, $offset + 8)
+    $blockEnd  = $offset + $blockSize
+
+    switch ($blockId) {
+
+        # XLST (X-axis)
+        0x54534C58 {
+            Add-Content $outFile "`n=== XLST (X-Axis) ==="
+
+            $dataOffset = $offset + 16
+
+            # Skip first 3 floats (12 bytes)
+            $realDataOffset = $dataOffset + 12
+
+            # Third float = number of points
+            $pointCount = [System.BitConverter]::ToSingle($bytes, $dataOffset + 8)
+
+            for ($i = 0; $i -lt $pointCount; $i++) {
+                $value = [System.BitConverter]::ToSingle($bytes, $realDataOffset + ($i * 4))
+                Add-Content $outFile $value
+            }
+        }
+
+        # YLST (Y-axis)
+        0x54534C59 {
+            Add-Content $outFile "`n=== YLST (Y-Axis) ==="
+
+            $dataOffset = $offset + 16
+            $realDataOffset = $dataOffset
+            $pointCount = [System.BitConverter]::ToSingle($bytes, $dataOffset + 8)
+
+            for ($i = 0; $i -lt $pointCount; $i++) {
+                $value = [System.BitConverter]::ToSingle($bytes, $realDataOffset + ($i * 4))
+                Add-Content $outFile $value
+            }
+        }
+    }
+
+    $offset = $blockEnd
+}
+
+Write-Host "Axes written to: $outFile" -ForegroundColor Green

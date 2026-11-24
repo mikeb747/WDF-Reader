@@ -1,0 +1,6 @@
+{
+  "name": "WDF Reader — Renishaw Raman Parser for Digital-Traveller",
+  "description": "Complete zero-dependency TypeScript parser and interactive inspector for Renishaw WiRE (.wdf) Raman spectroscopy files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

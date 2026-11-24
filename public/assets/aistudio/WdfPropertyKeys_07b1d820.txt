@@ -1,0 +1,15 @@
+0x0001 = Title
+0x0002 = Operator
+0x0003 = TimeStart
+0x0004 = TimeEnd
+0x0102 = LaserWavelength
+0x0103 = LaserPower
+0x0201 = ExposureTime
+0x0202 = Accumulations
+0x0243 = SpectralCenter
+0x0244 = SpectralRange
+0x0301 = ObjectiveLens
+0x0331 = Grating
+0x0401 = XPosition
+0x0402 = YPosition
+0x0403 = ZPosition
