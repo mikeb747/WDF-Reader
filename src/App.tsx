@@ -8,7 +8,7 @@ import { SpectrumView, type BaselineStrength } from './components/SpectrumView';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { TypeScriptExportView } from './components/TypeScriptExportView';
 import { stripWdfExtension } from './lib/format';
-import { parseWdf, type SpectralTargetUnit } from './lib/wdf';
+import { parseWdf, type SpectralTargetUnit, type WdfFile } from './lib/wdf';
 import { buildStandaloneWdfReaderTs } from './lib/wdf/exportModule';
 
 const BASE_URL = import.meta.env.BASE_URL || '/';
@@ -393,6 +393,32 @@ export default function App() {
     setSamples((prev) => prev.map((s) => (s.id === id ? { ...s, color } : s)));
   };
 
+  const handleCreateDerivedSample = useCallback(
+    ({ fileName, wdf, formulaLabel }: { fileName: string; wdf: WdfFile; formulaLabel: string }) => {
+      const id = `calc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const newSample: LoadedSample = {
+        id,
+        fileName,
+        folderName: null,
+        sourceLabel: formulaLabel,
+        bytes: new Uint8Array(0),
+        wdf,
+        visible: true,
+        color: allocateColor(),
+      };
+      setSamples((prev) => {
+        const visibleCount = prev.filter((s) => s.visible).length;
+        if (visibleCount <= 1) {
+          return [newSample, ...prev.map((s) => ({ ...s, visible: false }))];
+        }
+        return [newSample, ...prev];
+      });
+      setSelectedId(id);
+      setErrorMessage(null);
+    },
+    [allocateColor],
+  );
+
   const handleDownloadTsModule = () => {
     const code = buildStandaloneWdfReaderTs();
     triggerDownload(code, 'wdfReader.ts', 'text/typescript;charset=utf-8');
@@ -583,6 +609,7 @@ export default function App() {
               onToggleSampleVisible={handleToggleSampleVisible}
               onSetAllVisible={handleSetAllVisible}
               onChangeSampleColor={handleChangeSampleColor}
+              onCreateDerivedSample={handleCreateDerivedSample}
               isFullscreen={showChartFullscreen}
               onToggleFullscreen={() => setIsFullscreen((prev) => !prev)}
             />

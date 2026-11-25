@@ -9,6 +9,8 @@ import {
   parseWdf,
   subtractBaseline,
   autoSubtractBaseline,
+  parseArithmeticExpression,
+  computeSpectrumArithmetic,
   WdfBlockId,
   WdfDataType,
   WdfDataUnits,
@@ -417,6 +419,58 @@ test('autoSubtractBaseline adapts to fluorescent vs flat backgrounds and reveals
   const flatRes = autoSubtractBaseline(flatRaw);
   assert.equal(flatRes.profile, 'Flat');
   assert.ok(flatRes.lambda > fluorRes.lambda, 'Flat spectrum should use smoother lambda than fluorescent spectrum');
+});
+
+test('computeSpectrumArithmetic evaluates 1-dataset and 2-dataset formulas accurately', () => {
+  const siWdf = parseWdf(fs.readFileSync(SAMPLE_520_PATH));
+  const pclWdf = parseWdf(fs.readFileSync(SAMPLE_PCL_PATH));
+
+  // Example 1: "data 1" / 150
+  const divRes = computeSpectrumArithmetic({
+    expression: '"data 1" / 150',
+    primary: { wdf: siWdf, fileName: '532nm_1800_520scan' },
+    outputName: 'Si / 150',
+  });
+  assert.equal(divRes.pointCount, siWdf.header.pointsPerSpectrum);
+  assert.equal(divRes.interpolated, false);
+  const siOrig = getSpectrum(siWdf, 0);
+  const siDiv = getSpectrum(divRes.wdf, 0);
+  assert.ok(Math.abs(siDiv[0] - siOrig[0] / 150) < 1e-2);
+  assert.ok(divRes.wdf.summary.peakIntensity !== null);
+  assert.ok(
+    Math.abs(divRes.wdf.summary.peakIntensity - (siWdf.summary.peakIntensity ?? 0) / 150) < 0.05,
+  );
+
+  // Example 2: ("data 1" * 100) / (1 * "data 2") on identical grid (D1 vs D1 -> constant 100 everywhere non-zero)
+  const selfRatio = computeSpectrumArithmetic({
+    expression: '("data 1" * 100) / (1 * "data 2")',
+    primary: { wdf: siWdf, fileName: 'Si' },
+    secondary: { wdf: siWdf, fileName: 'Si' },
+    outputName: 'Self ratio',
+  });
+  const peakPointIdx = siOrig.indexOf(Math.max(...Array.from(siOrig)));
+  assert.ok(Math.abs(selfRatio.wdf.spectra[peakPointIdx] - 100) < 1e-2);
+
+  // Example 3: Unparenthesized "data 1" * 100 / 1 * "data 2" parses with standard left-to-right precedence
+  const parsed = parseArithmeticExpression('"data 1" * 100 / 1 * "data 2"');
+  assert.equal(parsed.usesD1, true);
+  assert.equal(parsed.usesD2, true);
+
+  // Example 4: Cross-unit 2-dataset arithmetic (Raman Shift vs Absolute Wavenumber) interpolates over overlap
+  const crossUnit = computeSpectrumArithmetic({
+    expression: '(D1 * 100) / (1 * D2)',
+    primary: { wdf: siWdf, fileName: 'Si' },
+    secondary: { wdf: pclWdf, fileName: 'PCL' },
+    outputName: 'Cross unit ratio',
+  });
+  assert.equal(crossUnit.interpolated, true);
+  assert.equal(crossUnit.overlapUsed, true);
+  assert.ok(crossUnit.pointCount > 100, 'Expected substantial Raman shift overlap (~825..1392 cm-1)');
+  assert.equal(crossUnit.wdf.xAxis?.units, WdfDataUnits.RamanShift);
+
+  // Rejects division by zero constant and invalid syntax
+  assert.throws(() => parseArithmeticExpression('D1 / 0'), /zero/i);
+  assert.throws(() => parseArithmeticExpression('D1 + * 5'), /unexpected/i);
 });
 
 test('rejects invalid or truncated inputs cleanly', () => {

@@ -11,3 +11,13 @@ export {
   wdfToCsv,
   type SpectralTargetUnit,
 } from './parser';
+export {
+  parseArithmeticExpression,
+  evaluateArithmeticAst,
+  computeSpectrumArithmetic,
+  type ArithmeticOperator,
+  type ArithmeticExprNode,
+  type ParsedArithmeticExpression,
+  type SpectrumArithmeticInput,
+  type SpectrumArithmeticResult,
+} from './arithmetic';

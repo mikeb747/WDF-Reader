@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Layers, Maximize2, Minimize2, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { Calculator, Crosshair, Layers, Maximize2, Minimize2, RotateCcw, Rows3, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
   autoSubtractBaseline,
   convertXAxis,
@@ -12,6 +12,7 @@ import {
   type WdfPeak,
 } from '../lib/wdf';
 import { stripWdfExtension } from '../lib/format';
+import { DataArithmeticModal } from './DataArithmeticModal';
 import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
@@ -37,6 +38,7 @@ interface SpectrumViewProps {
   onToggleSampleVisible: (id: string) => void;
   onSetAllVisible: (visible: boolean) => void;
   onChangeSampleColor: (id: string, color: string) => void;
+  onCreateDerivedSample?: (result: { fileName: string; wdf: WdfFile; formulaLabel: string }) => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
 }
@@ -98,6 +100,19 @@ interface ComputedTrace {
   peaks: WdfPeak[];
   autoBaselineProfile?: AutoBaselineResult['profile'];
   autoBaselineLambda?: number;
+}
+
+interface PickedPeakEntry {
+  id: string;
+  sampleId: string;
+  spectrumIndex: number;
+  origIdx: number;
+}
+
+interface ResolvedPickedPeak {
+  entry: PickedPeakEntry;
+  trace: ComputedTrace;
+  point: ComputedTrace['points'][number];
 }
 
 function buildTrace(
@@ -241,6 +256,46 @@ function findNearestPoint(
   return best;
 }
 
+function findLocalPeakPoint(
+  points: ComputedTrace['points'],
+  dataX: number,
+  windowHalfWidthX: number,
+): ComputedTrace['points'][number] | null {
+  if (points.length === 0) return null;
+  let nearestIdx = 0;
+  let nearestDist = Math.abs(points[0].x - dataX);
+  for (let i = 1; i < points.length; i++) {
+    const d = Math.abs(points[i].x - dataX);
+    if (d < nearestDist) {
+      nearestDist = d;
+      nearestIdx = i;
+    }
+  }
+
+  // Gather candidate indices within ±windowHalfWidthX (at least ±3 samples around click)
+  let startIdx = nearestIdx;
+  while (startIdx > 0 && (Math.abs(points[startIdx - 1].x - dataX) <= windowHalfWidthX || nearestIdx - startIdx < 3)) {
+    startIdx--;
+  }
+  let endIdx = nearestIdx;
+  while (
+    endIdx < points.length - 1 &&
+    (Math.abs(points[endIdx + 1].x - dataX) <= windowHalfWidthX || endIdx - nearestIdx < 3)
+  ) {
+    endIdx++;
+  }
+
+  let bestIdx = nearestIdx;
+  let bestY = points[nearestIdx].y;
+  for (let i = startIdx; i <= endIdx; i++) {
+    if (points[i].y > bestY) {
+      bestY = points[i].y;
+      bestIdx = i;
+    }
+  }
+  return points[bestIdx];
+}
+
 function computeMedian(values: number[]): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -270,6 +325,7 @@ export function SpectrumView({
   onToggleSampleVisible,
   onSetAllVisible,
   onChangeSampleColor,
+  onCreateDerivedSample,
   isFullscreen = false,
   onToggleFullscreen,
 }: SpectrumViewProps) {
@@ -278,9 +334,15 @@ export function SpectrumView({
   const [sortAscending, setSortAscending] = useState(true);
   const [showFittedBaseline, setShowFittedBaseline] = useState(false);
   const [normalizeOverlay, setNormalizeOverlay] = useState(false);
+  const [autoOffset, setAutoOffset] = useState(false);
+  const [arithmeticModalOpen, setArithmeticModalOpen] = useState(false);
   const [zoomRange, setZoomRange] = useState<[number, number] | null>(null);
-  const [dragSelection, setDragSelection] = useState<{ startX: number; currentX: number } | null>(null);
+  const [dragSelection, setDragSelection] = useState<{ startX: number; currentX: number; startY: number } | null>(null);
   const [hoverDataX, setHoverDataX] = useState<number | null>(null);
+  const [hoverSvgY, setHoverSvgY] = useState<number | null>(null);
+  const [peakPickingMode, setPeakPickingMode] = useState(false);
+  const [snapToLocalPeak, setSnapToLocalPeak] = useState(true);
+  const [pickedPeaks, setPickedPeaks] = useState<PickedPeakEntry[]>([]);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   const visibleSamples = useMemo(() => {
@@ -353,11 +415,30 @@ export function SpectrumView({
   ]);
 
   const primaryTrace = traces.find((t) => t.id === activeSampleId) ?? traces[0] ?? null;
+  const isAutoOffsetActive = isMultiOverlay && autoOffset;
 
-  const viewDomain = useMemo(() => {
-    if (traces.length === 0) {
-      return { xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+  const handleToggleAutoOffset = () => {
+    if (!isMultiOverlay && samples.length >= 2) {
+      onSetAllVisible(true);
+      setAutoOffset(true);
+    } else {
+      setAutoOffset((prev) => !prev);
     }
+  };
+
+  // Compute adaptive non-overlapping Y-axis offsets so stacked traces match Explorer order (top to bottom)
+  const { traceYOffsets, traceBaselineGuides, viewDomain } = useMemo(() => {
+    const offsets = new Map<string, number>();
+    const baselineGuides = new Map<string, number>();
+
+    if (traces.length === 0) {
+      return {
+        traceYOffsets: offsets,
+        traceBaselineGuides: baselineGuides,
+        viewDomain: { xMin: 0, xMax: 1, yMin: 0, yMax: 1 },
+      };
+    }
+
     let globalMinX = Infinity;
     let globalMaxX = -Infinity;
     for (const tr of traces) {
@@ -367,16 +448,58 @@ export function SpectrumView({
     const xMin = zoomRange ? Math.min(zoomRange[0], zoomRange[1]) : globalMinX;
     const xMax = zoomRange ? Math.max(zoomRange[0], zoomRange[1]) : globalMaxX;
 
+    if (isAutoOffsetActive) {
+      const localRanges = traces.map((tr) => {
+        let minV = Infinity;
+        let maxV = -Infinity;
+        for (let i = 0; i < tr.points.length; i++) {
+          const p = tr.points[i];
+          if (p.x >= xMin && p.x <= xMax) {
+            if (p.y < minV) minV = p.y;
+            if (p.y > maxV) maxV = p.y;
+          }
+        }
+        if (!Number.isFinite(minV) || !Number.isFinite(maxV)) {
+          minV = tr.minY;
+          maxV = tr.maxY;
+        }
+        return { id: tr.id, minV, maxV, span: Math.max(0, maxV - minV) };
+      });
+
+      const positiveSpans = localRanges.map((r) => r.span).filter((s) => s > 0);
+      const maxSpan = positiveSpans.length > 0 ? Math.max(...positiveSpans) : 1;
+      const medSpan = positiveSpans.length > 0 ? computeMedian(positiveSpans) : 1;
+      const laneGap = Math.max(medSpan * 0.16, maxSpan * 0.06, 1);
+
+      let runningTopY = 0;
+      for (let i = localRanges.length - 1; i >= 0; i--) {
+        const r = localRanges[i];
+        if (i === localRanges.length - 1) {
+          offsets.set(r.id, 0);
+          baselineGuides.set(r.id, r.minV);
+          runningTopY = r.maxV;
+        } else {
+          const targetBase = runningTopY + laneGap;
+          const offset = targetBase - r.minV;
+          offsets.set(r.id, offset);
+          baselineGuides.set(r.id, targetBase);
+          runningTopY = r.maxV + offset;
+        }
+      }
+    }
+
     let yMin = Infinity;
     let yMax = -Infinity;
     let found = false;
     for (const tr of traces) {
+      const yOffset = isAutoOffsetActive ? (offsets.get(tr.id) ?? 0) : 0;
       for (let i = 0; i < tr.points.length; i++) {
         const p = tr.points[i];
         if (p.x >= xMin && p.x <= xMax) {
           found = true;
-          if (p.y < yMin) yMin = p.y;
-          if (p.y > yMax) yMax = p.y;
+          const shiftedY = p.y + yOffset;
+          if (shiftedY < yMin) yMin = shiftedY;
+          if (shiftedY > yMax) yMax = shiftedY;
           if (!isMultiOverlay && baselineEnabled && showFittedBaseline) {
             if (p.rawY < yMin) yMin = p.rawY;
             if (p.rawY > yMax) yMax = p.rawY;
@@ -392,12 +515,19 @@ export function SpectrumView({
     }
     const yPad = (yMax - yMin) * 0.08 || 1;
     return {
-      xMin,
-      xMax: xMax === xMin ? xMin + 1 : xMax,
-      yMin: yMin - yPad * 0.35,
-      yMax: yMax + yPad,
+      traceYOffsets: offsets,
+      traceBaselineGuides: baselineGuides,
+      viewDomain: {
+        xMin,
+        xMax: xMax === xMin ? xMin + 1 : xMax,
+        yMin: yMin - yPad * 0.35,
+        yMax: yMax + yPad,
+      },
     };
-  }, [traces, zoomRange, isMultiOverlay, baselineEnabled, showFittedBaseline]);
+  }, [traces, zoomRange, isMultiOverlay, isAutoOffsetActive, baselineEnabled, showFittedBaseline]);
+
+  const getTraceYOffset = (traceId: string) =>
+    isAutoOffsetActive ? (traceYOffsets.get(traceId) ?? 0) : 0;
 
   const mapX = (x: number) =>
     MARGIN.left + ((x - viewDomain.xMin) / (viewDomain.xMax - viewDomain.xMin)) * PLOT_W;
@@ -425,7 +555,8 @@ export function SpectrumView({
     };
 
     return traces.map((tr) => {
-      const mainD = buildPath(tr.points, (p) => p.y);
+      const yOffset = isAutoOffsetActive ? (traceYOffsets.get(tr.id) ?? 0) : 0;
+      const mainD = buildPath(tr.points, (p) => p.y + yOffset);
       const rawD = !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.rawY) : '';
       const baseD =
         !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.baselineY) : '';
@@ -441,16 +572,16 @@ export function SpectrumView({
         }
       }
 
-      return { trace: tr, mainD, rawD, baseD, areaD };
+      return { trace: tr, mainD, rawD, baseD, areaD, yOffset };
     });
-  }, [traces, viewDomain, isMultiOverlay, baselineEnabled, showFittedBaseline]);
+  }, [traces, viewDomain, isMultiOverlay, isAutoOffsetActive, traceYOffsets, baselineEnabled, showFittedBaseline]);
 
   const xTicks = useMemo(() => niceTicks(viewDomain.xMin, viewDomain.xMax, 7), [viewDomain.xMin, viewDomain.xMax]);
   const yTicks = useMemo(() => niceTicks(viewDomain.yMin, viewDomain.yMax, 6), [viewDomain.yMin, viewDomain.yMax]);
   const xStep = xTicks.length >= 2 ? Math.abs(xTicks[1] - xTicks[0]) : 1;
   const yStep = yTicks.length >= 2 ? Math.abs(yTicks[1] - yTicks[0]) : 1;
 
-  const getSvgCoords = (clientX: number, clientY: number): number | null => {
+  const getSvgCoords = (clientX: number, clientY: number): { x: number; y: number } | null => {
     const svg = svgRef.current;
     if (!svg) return null;
     const ctm = svg.getScreenCTM();
@@ -459,31 +590,92 @@ export function SpectrumView({
       pt.x = clientX;
       pt.y = clientY;
       const transformed = pt.matrixTransform(ctm.inverse());
-      if (Number.isFinite(transformed.x)) return transformed.x;
+      if (Number.isFinite(transformed.x) && Number.isFinite(transformed.y)) {
+        return { x: transformed.x, y: transformed.y };
+      }
     }
     const rect = svg.getBoundingClientRect();
-    if (rect.width <= 0) return null;
-    return ((clientX - rect.left) / rect.width) * CHART_WIDTH;
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: ((clientX - rect.left) / rect.width) * CHART_WIDTH,
+      y: ((clientY - rect.top) / rect.height) * CHART_HEIGHT,
+    };
+  };
+
+  // Pick candidate trace & point for a given plot coordinate in Peak Picking mode
+  const findPickCandidate = (
+    dataX: number,
+    svgY: number | null,
+  ): { trace: ComputedTrace; point: ComputedTrace['points'][number] } | null => {
+    if (traces.length === 0) return null;
+    const windowHalfX = Math.abs(viewDomain.xMax - viewDomain.xMin) * 0.025;
+    let best: { trace: ComputedTrace; point: ComputedTrace['points'][number]; dy: number } | null = null;
+
+    for (const tr of traces) {
+      const pt = snapToLocalPeak
+        ? findLocalPeakPoint(tr.points, dataX, windowHalfX)
+        : findNearestPoint(tr.points, dataX);
+      if (!pt) continue;
+      const dy = svgY !== null ? Math.abs(mapY(pt.y + getTraceYOffset(tr.id)) - svgY) : 0;
+      if (!best || dy < best.dy) {
+        best = { trace: tr, point: pt, dy };
+      }
+    }
+    return best ? { trace: best.trace, point: best.point } : null;
+  };
+
+  const togglePickedPeakAt = (trace: ComputedTrace, origIdx: number) => {
+    const specIdx = trace.id === activeSampleId ? spectrumIndex : 0;
+    setPickedPeaks((prev) => {
+      const existing = prev.find(
+        (p) => p.sampleId === trace.id && p.spectrumIndex === specIdx && p.origIdx === origIdx,
+      );
+      if (existing) {
+        return prev.filter((p) => p.id !== existing.id);
+      }
+      return [
+        ...prev,
+        {
+          id: `${trace.id}-${specIdx}-${origIdx}`,
+          sampleId: trace.id,
+          spectrumIndex: specIdx,
+          origIdx,
+        },
+      ];
+    });
+  };
+
+  const removePickedPeak = (id: string) => {
+    setPickedPeaks((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  const clearVisiblePickedPeaks = () => {
+    const visibleIds = new Set(traces.map((t) => t.id));
+    setPickedPeaks((prev) => prev.filter((p) => !visibleIds.has(p.sampleId)));
   };
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (traces.length === 0) return;
-    const svgX = getSvgCoords(e.clientX, e.clientY);
-    if (svgX === null) return;
+    const coords = getSvgCoords(e.clientX, e.clientY);
+    if (!coords) return;
 
-    const clampedX = Math.max(MARGIN.left, Math.min(MARGIN.left + PLOT_W, svgX));
+    const clampedX = Math.max(MARGIN.left, Math.min(MARGIN.left + PLOT_W, coords.x));
+    const clampedY = Math.max(MARGIN.top, Math.min(MARGIN.top + PLOT_H, coords.y));
     if (dragSelection) {
       setDragSelection((prev) => (prev ? { ...prev, currentX: clampedX } : null));
     }
 
     setHoverDataX(unmapX(clampedX));
+    setHoverSvgY(clampedY);
   };
 
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
-    const svgX = getSvgCoords(e.clientX, e.clientY);
-    if (svgX === null) return;
-    if (svgX < MARGIN.left || svgX > MARGIN.left + PLOT_W) return;
-    setDragSelection({ startX: svgX, currentX: svgX });
+    if (e.button !== 0) return;
+    const coords = getSvgCoords(e.clientX, e.clientY);
+    if (!coords) return;
+    if (coords.x < MARGIN.left || coords.x > MARGIN.left + PLOT_W) return;
+    if (coords.y < MARGIN.top || coords.y > MARGIN.top + PLOT_H) return;
+    setDragSelection({ startX: coords.x, currentX: coords.x, startY: coords.y });
   };
 
   const handlePointerUp = () => {
@@ -494,6 +686,12 @@ export function SpectrumView({
         const x2 = unmapX(Math.max(dragSelection.startX, dragSelection.currentX));
         if (x2 > x1) {
           setZoomRange([x1, x2]);
+        }
+      } else if (peakPickingMode && dist < 8) {
+        const clickDataX = unmapX(dragSelection.startX);
+        const candidate = findPickCandidate(clickDataX, dragSelection.startY);
+        if (candidate) {
+          togglePickedPeakAt(candidate.trace, candidate.point.origIdx);
         }
       }
       setDragSelection(null);
@@ -510,6 +708,122 @@ export function SpectrumView({
       })
       .filter((m): m is { trace: ComputedTrace; point: ComputedTrace['points'][number] } => m !== null);
   }, [traces, hoverDataX]);
+
+  const hoverPickCandidate = useMemo(() => {
+    if (!peakPickingMode || hoverDataX === null) return null;
+    return findPickCandidate(hoverDataX, hoverSvgY);
+  }, [peakPickingMode, hoverDataX, hoverSvgY, traces, snapToLocalPeak, viewDomain]);
+
+  // Resolve stored picked peak entries onto currently visible traces so X-unit & baseline changes update automatically
+  const resolvedPickedPeaks = useMemo<ResolvedPickedPeak[]>(() => {
+    const traceMap = new Map(traces.map((t) => [t.id, t]));
+    const list: ResolvedPickedPeak[] = [];
+    for (const entry of pickedPeaks) {
+      const tr = traceMap.get(entry.sampleId);
+      if (!tr) continue;
+      const expectedSpecIdx = tr.id === activeSampleId ? spectrumIndex : 0;
+      if (entry.spectrumIndex !== expectedSpecIdx) continue;
+      const pt = tr.points.find((p) => p.origIdx === entry.origIdx);
+      if (!pt) continue;
+      list.push({ entry, trace: tr, point: pt });
+    }
+    list.sort((a, b) => a.point.x - b.point.x);
+    return list;
+  }, [pickedPeaks, traces, activeSampleId, spectrumIndex]);
+
+  // Compute non-overlapping SVG label coordinates for visible picked peak annotations
+  const pickedAnnotationsLayout = useMemo(() => {
+    const visible = resolvedPickedPeaks.filter(
+      (item) => item.point.x >= viewDomain.xMin && item.point.x <= viewDomain.xMax,
+    );
+    const xDecimals = effectiveUnit === 'electronVolt' ? 4 : 2;
+    const placedBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+
+    return visible.map((item) => {
+      const px = mapX(item.point.x);
+      const py = mapY(item.point.y + getTraceYOffset(item.trace.id));
+      const xLabel = item.trace.symbol
+        ? `${item.point.x.toFixed(xDecimals)} ${item.trace.symbol}`
+        : item.point.x.toFixed(xDecimals);
+      const yLabel =
+        isMultiOverlay && normalizeOverlay
+          ? `${item.point.y.toFixed(1)}%`
+          : `${item.point.y.toLocaleString(undefined, { maximumFractionDigits: 1 })} cts`;
+      const maxChars = Math.max(xLabel.length, yLabel.length);
+      const boxW = Math.max(76, maxChars * 6.4 + 14);
+      const boxH = 30;
+
+      const minCenterX = MARGIN.left + boxW / 2 + 4;
+      const maxCenterX = MARGIN.left + PLOT_W - boxW / 2 - 4;
+      let boxCenterX = Math.max(minCenterX, Math.min(maxCenterX, px));
+      let boxTop = py - boxH - 14;
+      let sideAnchor: 'bottom' | 'left' | 'right' | 'top' = 'bottom';
+
+      // When a tall peak apex is near the top edge, place the annotation cleanly to the side so the apex stays unobstructed
+      if (boxTop < MARGIN.top + 4) {
+        boxTop = Math.max(MARGIN.top + 6, Math.min(MARGIN.top + PLOT_H - boxH - 4, py - boxH / 2 + 6));
+        const rightCenter = px + boxW / 2 + 16;
+        const leftCenter = px - boxW / 2 - 16;
+        if (rightCenter <= maxCenterX) {
+          boxCenterX = rightCenter;
+          sideAnchor = 'left';
+        } else {
+          boxCenterX = Math.max(minCenterX, leftCenter);
+          sideAnchor = 'right';
+        }
+      }
+
+      const boxLeft = boxCenterX - boxW / 2;
+      const boxRight = boxCenterX + boxW / 2;
+
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const collides = placedBoxes.some(
+          (b) => !(boxRight + 3 < b.left || boxLeft - 3 > b.right || boxTop + boxH + 3 < b.top || boxTop - 3 > b.bottom),
+        );
+        if (!collides) break;
+        const shiftedUp = boxTop - (boxH + 5);
+        if (shiftedUp >= MARGIN.top + 4) {
+          boxTop = shiftedUp;
+        } else {
+          const shiftedDown = boxTop + (boxH + 5);
+          if (shiftedDown + boxH <= MARGIN.top + PLOT_H - 4) {
+            boxTop = shiftedDown;
+          } else {
+            break;
+          }
+        }
+      }
+
+      placedBoxes.push({ left: boxLeft, right: boxRight, top: boxTop, bottom: boxTop + boxH });
+
+      let leaderEndX = boxCenterX;
+      let leaderEndY = boxTop + boxH;
+      if (sideAnchor === 'left') {
+        leaderEndX = boxLeft;
+        leaderEndY = boxTop + boxH / 2;
+      } else if (sideAnchor === 'right') {
+        leaderEndX = boxRight;
+        leaderEndY = boxTop + boxH / 2;
+      } else if (boxTop > py) {
+        leaderEndY = boxTop;
+      }
+
+      return {
+        ...item,
+        px,
+        py,
+        xLabel,
+        yLabel,
+        boxW,
+        boxH,
+        boxLeft,
+        boxTop,
+        boxCenterX,
+        leaderEndX,
+        leaderEndY,
+      };
+    });
+  }, [resolvedPickedPeaks, viewDomain, effectiveUnit, isMultiOverlay, normalizeOverlay, isAutoOffsetActive, traceYOffsets]);
 
   const totalSpectra = Math.max(1, Math.floor(wdf.spectra.length / Math.max(1, wdf.header.pointsPerSpectrum)));
 
@@ -691,10 +1005,16 @@ export function SpectrumView({
 
   const yAxisTitle =
     isMultiOverlay && normalizeOverlay
-      ? 'Normalized Intensity (%)'
+      ? isAutoOffsetActive
+        ? 'Normalized Intensity (Auto-Offset, %)'
+        : 'Normalized Intensity (%)'
       : baselineEnabled
-        ? `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
-        : `Intensity (${wdf.header.spectralUnitsName})`;
+        ? isAutoOffsetActive
+          ? `Baseline-Corrected Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
+          : `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
+        : isAutoOffsetActive
+          ? `Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
+          : `Intensity (${wdf.header.spectralUnitsName})`;
 
   return (
     <div
@@ -718,6 +1038,7 @@ export function SpectrumView({
                 <>
                   Comparing {traces.map((t) => t.fileName).join(' · ')} · Axis: {primaryTrace.label}
                   {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
+                  {isAutoOffsetActive ? ' · Auto-Offset (Stacked)' : ''}
                 </>
               ) : (
                 <>
@@ -810,9 +1131,87 @@ export function SpectrumView({
               <Layers className="w-3.5 h-3.5" aria-hidden="true" />
               <span>{isMultiOverlay ? `Overlay (${traces.length})` : 'Overlay Mode'}</span>
             </button>
+
+            {/* Auto-Offset Stacked Spectra Toggle */}
+            <button
+              type="button"
+              onClick={handleToggleAutoOffset}
+              disabled={samples.length < 2}
+              aria-pressed={isAutoOffsetActive}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                isAutoOffsetActive
+                  ? 'bg-blue-600 border-blue-600 text-white'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+              }`}
+              title="Vertically stack multiple selected spectra along the Y-axis so individual Raman features do not overlap"
+            >
+              <Rows3 className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Auto-Offset</span>
+            </button>
+
+            {/* Interactive Peak Picking Toggle */}
+            <button
+              type="button"
+              onClick={() => setPeakPickingMode((prev) => !prev)}
+              aria-pressed={peakPickingMode}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                peakPickingMode
+                  ? 'bg-blue-600 border-blue-600 text-white'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+              }`}
+              title="Click on the spectrum to annotate specific Raman peaks with their exact X position and intensity"
+            >
+              <Crosshair className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>
+                {resolvedPickedPeaks.length > 0
+                  ? `Peak Picking (${resolvedPickedPeaks.length})`
+                  : 'Peak Picking'}
+              </span>
+            </button>
+
+            {/* Data Arithmetic Modal Trigger */}
+            {onCreateDerivedSample && (
+              <button
+                type="button"
+                onClick={() => setArithmeticModalOpen(true)}
+                disabled={samples.length === 0}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:border-slate-300 text-xs font-medium whitespace-nowrap transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Apply mathematical expressions (+, −, ×, ÷) to 1 or 2 selected datasets"
+              >
+                <Calculator className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Data Arithmetic</span>
+              </button>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
+            {peakPickingMode && (
+              <label
+                className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap"
+                title="Automatically snap clicks to the highest local peak near the cursor"
+              >
+                <input
+                  type="checkbox"
+                  checked={snapToLocalPeak}
+                  onChange={(e) => setSnapToLocalPeak(e.target.checked)}
+                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span>Snap to peak</span>
+              </label>
+            )}
+
+            {resolvedPickedPeaks.length > 0 && (
+              <button
+                type="button"
+                onClick={clearVisiblePickedPeaks}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 cursor-pointer whitespace-nowrap"
+                title="Remove all manually annotated peaks from the current view"
+              >
+                <Trash2 className="w-3 h-3" aria-hidden="true" />
+                <span>Clear Picks ({resolvedPickedPeaks.length})</span>
+              </button>
+            )}
+
             {baselineEnabled && !isMultiOverlay && (
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap">
                 <input
@@ -945,7 +1344,37 @@ export function SpectrumView({
         {/* Live Crosshair Readout Bar */}
         <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="font-mono tabular-nums text-slate-700 flex flex-wrap items-center gap-x-5 gap-y-1">
-            {hoveredMatches.length > 0 ? (
+            {peakPickingMode && hoverPickCandidate ? (
+              <>
+                <span className="font-sans font-medium text-blue-700">Click to annotate:</span>
+                <span>
+                  <span className="text-slate-500 mr-1.5">{primaryTrace.label}:</span>
+                  <strong className="font-semibold text-slate-900">
+                    {hoverPickCandidate.point.x.toFixed(effectiveUnit === 'electronVolt' ? 4 : 2)}{' '}
+                    {primaryTrace.symbol}
+                  </strong>
+                </span>
+                <span>
+                  <span className="text-slate-500 mr-1.5">
+                    {baselineEnabled ? 'Corrected:' : 'Intensity:'}
+                  </span>
+                  <strong className="font-semibold text-slate-900">
+                    {isMultiOverlay && normalizeOverlay
+                      ? `${hoverPickCandidate.point.y.toFixed(1)}%`
+                      : `${hoverPickCandidate.point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${wdf.header.spectralUnitsName.toLowerCase()}`}
+                  </strong>
+                </span>
+                {isMultiOverlay && (
+                  <span className="inline-flex items-center gap-1.5 text-slate-600">
+                    <span
+                      className="w-2 h-2 rounded-xs shrink-0 inline-block"
+                      style={{ backgroundColor: hoverPickCandidate.trace.color }}
+                    />
+                    <span className="truncate max-w-[140px]">{hoverPickCandidate.trace.fileName}</span>
+                  </span>
+                )}
+              </>
+            ) : hoveredMatches.length > 0 ? (
               isMultiOverlay ? (
                 <>
                   <span className="text-slate-500">
@@ -997,6 +1426,10 @@ export function SpectrumView({
                   <span className="text-slate-500">Pixel #{hoveredMatches[0].point.origIdx}</span>
                 </>
               )
+            ) : peakPickingMode ? (
+              <span className="text-blue-700 font-sans font-medium">
+                Peak Picking active · Click anywhere on the spectrum to annotate a peak · Click a label to remove · Drag to zoom
+              </span>
             ) : (
               <span className="text-slate-500">
                 Hover plot to inspect exact coordinates · Drag horizontally across plot to zoom X range
@@ -1057,6 +1490,7 @@ export function SpectrumView({
             onPointerUp={handlePointerUp}
             onPointerLeave={() => {
               setHoverDataX(null);
+              setHoverSvgY(null);
               setDragSelection(null);
             }}
           >
@@ -1167,9 +1601,61 @@ export function SpectrumView({
                 />
               )}
 
+              {/* Stacked Lane Baseline Guides & Inline Labels (Auto-Offset mode) */}
+              {isAutoOffsetActive &&
+                traces.map((tr) => {
+                  const guideY = traceBaselineGuides.get(tr.id);
+                  if (guideY === undefined) return null;
+                  const py = mapY(guideY);
+                  const xSpan = Math.max(1e-9, viewDomain.xMax - viewDomain.xMin);
+                  const leftGap = Math.max(0, tr.minX - viewDomain.xMin) / xSpan;
+                  const rightGap = Math.max(0, viewDomain.xMax - tr.maxX) / xSpan;
+                  let placeOnLeft = leftGap > rightGap + 0.03;
+                  if (Math.abs(leftGap - rightGap) <= 0.03) {
+                    const leftCut = viewDomain.xMin + xSpan * 0.25;
+                    const rightCut = viewDomain.xMax - xSpan * 0.25;
+                    let leftPeak = -Infinity;
+                    let rightPeak = -Infinity;
+                    for (let i = 0; i < tr.points.length; i++) {
+                      const pt = tr.points[i];
+                      if (pt.x >= viewDomain.xMin && pt.x <= leftCut && pt.y > leftPeak) leftPeak = pt.y;
+                      if (pt.x >= rightCut && pt.x <= viewDomain.xMax && pt.y > rightPeak) rightPeak = pt.y;
+                    }
+                    placeOnLeft = leftPeak < rightPeak;
+                  }
+                  return (
+                    <g key={`offset-lane-${tr.id}`} data-offset-lane={tr.id} pointerEvents="none">
+                      <line
+                        x1={MARGIN.left}
+                        y1={py}
+                        x2={MARGIN.left + PLOT_W}
+                        y2={py}
+                        stroke={tr.color}
+                        strokeWidth="1"
+                        strokeOpacity="0.22"
+                        strokeDasharray="4 4"
+                      />
+                      <text
+                        x={placeOnLeft ? MARGIN.left + 8 : MARGIN.left + PLOT_W - 8}
+                        y={Math.max(MARGIN.top + 12, py - 5)}
+                        textAnchor={placeOnLeft ? 'start' : 'end'}
+                        fontSize="10"
+                        fontFamily="IBM Plex Mono, monospace"
+                        fontWeight="600"
+                        fill={tr.color}
+                        stroke="#FFFFFF"
+                        strokeWidth="3"
+                        paintOrder="stroke"
+                      >
+                        {tr.fileName}
+                      </text>
+                    </g>
+                  );
+                })}
+
               {/* Traces */}
               {tracePaths.map(({ trace, mainD, rawD, baseD, areaD }) => (
-                <g key={trace.id}>
+                <g key={trace.id} data-trace-id={trace.id}>
                   {rawD && (
                     <path
                       d={rawD}
@@ -1225,7 +1711,12 @@ export function SpectrumView({
                     .filter((p) => p.x >= viewDomain.xMin && p.x <= viewDomain.xMax)
                     .map((pk) => {
                       const px = mapX(pk.x);
-                      const py = mapY(pk.intensity);
+                      const py = mapY(pk.intensity + getTraceYOffset(tr.id));
+                      // Suppress simple auto-label when user has already placed a detailed annotation on this peak
+                      const coveredByPicked = pickedAnnotationsLayout.some(
+                        (ann) => ann.trace.id === tr.id && Math.abs(ann.px - px) < 22,
+                      );
+                      if (coveredByPicked) return null;
                       const labelY = Math.max(MARGIN.top + 14, py - 10);
                       return (
                         <g key={`${tr.id}-pk-${pk.index}`}>
@@ -1258,40 +1749,148 @@ export function SpectrumView({
                     }),
                 )}
 
+              {/* User-Picked Peak Annotations */}
+              {pickedAnnotationsLayout.map((ann) => (
+                <g
+                  key={ann.entry.id}
+                  data-picked-peak={ann.entry.id}
+                  className="cursor-pointer"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removePickedPeak(ann.entry.id);
+                  }}
+                >
+                  <title>{`Annotated peak: ${ann.xLabel} (${ann.yLabel}) — Click label to remove`}</title>
+                  <line
+                    x1={ann.px}
+                    y1={ann.py}
+                    x2={ann.leaderEndX}
+                    y2={ann.leaderEndY}
+                    stroke={ann.trace.color}
+                    strokeWidth="1.25"
+                    strokeDasharray="3 2"
+                  />
+                  <circle
+                    cx={ann.px}
+                    cy={ann.py}
+                    r="4.2"
+                    fill={ann.trace.color}
+                    stroke="#FFFFFF"
+                    strokeWidth="1.6"
+                  />
+                  <rect
+                    x={ann.boxLeft}
+                    y={ann.boxTop}
+                    width={ann.boxW}
+                    height={ann.boxH}
+                    rx="3"
+                    fill="#FFFFFF"
+                    fillOpacity="0.96"
+                    stroke={ann.trace.color}
+                    strokeWidth="1.2"
+                  />
+                  <text
+                    x={ann.boxCenterX}
+                    y={ann.boxTop + 12}
+                    textAnchor="middle"
+                    fontSize="10"
+                    fontFamily="IBM Plex Mono, monospace"
+                    fontWeight="600"
+                    fill="#0F172A"
+                  >
+                    {ann.xLabel}
+                  </text>
+                  <text
+                    x={ann.boxCenterX}
+                    y={ann.boxTop + 24}
+                    textAnchor="middle"
+                    fontSize="9.5"
+                    fontFamily="IBM Plex Mono, monospace"
+                    fontWeight="500"
+                    fill="#475569"
+                  >
+                    {ann.yLabel}
+                  </text>
+                </g>
+              ))}
+
               {/* Crosshair Lines & Snap Dots */}
               {hoverDataX !== null && hoveredMatches.length > 0 && (
-                <g>
+                <g pointerEvents="none">
                   <line
-                    x1={mapX(isMultiOverlay ? hoverDataX : hoveredMatches[0].point.x)}
+                    x1={mapX(
+                      peakPickingMode && hoverPickCandidate
+                        ? hoverPickCandidate.point.x
+                        : isMultiOverlay
+                          ? hoverDataX
+                          : hoveredMatches[0].point.x,
+                    )}
                     y1={MARGIN.top}
-                    x2={mapX(isMultiOverlay ? hoverDataX : hoveredMatches[0].point.x)}
+                    x2={mapX(
+                      peakPickingMode && hoverPickCandidate
+                        ? hoverPickCandidate.point.x
+                        : isMultiOverlay
+                          ? hoverDataX
+                          : hoveredMatches[0].point.x,
+                    )}
                     y2={MARGIN.top + PLOT_H}
-                    stroke="#64748B"
+                    stroke={peakPickingMode ? '#2563EB' : '#64748B'}
                     strokeWidth="1"
                     strokeDasharray="3 3"
                   />
-                  {!isMultiOverlay && (
+                  {(!isMultiOverlay || (peakPickingMode && hoverPickCandidate)) && (
                     <line
                       x1={MARGIN.left}
-                      y1={mapY(hoveredMatches[0].point.y)}
+                      y1={mapY(
+                        peakPickingMode && hoverPickCandidate
+                          ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
+                          : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                      )}
                       x2={MARGIN.left + PLOT_W}
-                      y2={mapY(hoveredMatches[0].point.y)}
-                      stroke="#64748B"
+                      y2={mapY(
+                        peakPickingMode && hoverPickCandidate
+                          ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
+                          : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                      )}
+                      stroke={peakPickingMode ? '#2563EB' : '#64748B'}
                       strokeWidth="1"
                       strokeDasharray="3 3"
                     />
                   )}
-                  {hoveredMatches.map(({ trace, point }) => (
-                    <circle
-                      key={`snap-${trace.id}`}
-                      cx={mapX(point.x)}
-                      cy={mapY(point.y)}
-                      r="4"
-                      fill={trace.color}
-                      stroke="#FFFFFF"
-                      strokeWidth="1.5"
-                    />
-                  ))}
+                  {peakPickingMode && hoverPickCandidate ? (
+                    <g>
+                      <circle
+                        cx={mapX(hoverPickCandidate.point.x)}
+                        cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
+                        r="7"
+                        fill="none"
+                        stroke={hoverPickCandidate.trace.color}
+                        strokeWidth="1.5"
+                        strokeDasharray="2 2"
+                      />
+                      <circle
+                        cx={mapX(hoverPickCandidate.point.x)}
+                        cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
+                        r="3.5"
+                        fill={hoverPickCandidate.trace.color}
+                        stroke="#FFFFFF"
+                        strokeWidth="1.5"
+                      />
+                    </g>
+                  ) : (
+                    hoveredMatches.map(({ trace, point }) => (
+                      <circle
+                        key={`snap-${trace.id}`}
+                        cx={mapX(point.x)}
+                        cy={mapY(point.y + getTraceYOffset(trace.id))}
+                        r="4"
+                        fill={trace.color}
+                        stroke="#FFFFFF"
+                        strokeWidth="1.5"
+                      />
+                    ))
+                  )}
                 </g>
               )}
             </g>
@@ -1516,6 +2115,88 @@ export function SpectrumView({
             </section>
           )}
 
+          {/* User-Annotated Peaks Table (shown whenever peaks are picked) */}
+          {resolvedPickedPeaks.length > 0 && (
+            <section
+              aria-label="Annotated Peaks"
+              className="bg-white border border-slate-200 rounded overflow-hidden"
+            >
+              <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
+                    Annotated Peaks ({resolvedPickedPeaks.length})
+                  </h2>
+                  <span className="text-[11px] font-mono text-slate-500">
+                    {primaryTrace.label} ({primaryTrace.symbol || 'a.u.'})
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={clearVisiblePickedPeaks}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium text-slate-600 cursor-pointer transition-colors"
+                >
+                  <Trash2 className="w-3 h-3" aria-hidden="true" />
+                  <span>Clear All</span>
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-slate-500 bg-white">
+                      <th className="py-2 px-4 font-medium">#</th>
+                      {isMultiOverlay && <th className="py-2 px-4 font-medium">Sample</th>}
+                      <th className="py-2 px-4 font-medium">Position ({primaryTrace.symbol || 'X'})</th>
+                      <th className="py-2 px-4 font-medium text-right">
+                        {isMultiOverlay && normalizeOverlay
+                          ? 'Intensity (%)'
+                          : `Intensity (${wdf.header.spectralUnitsName})`}
+                      </th>
+                      <th className="py-2 px-4 font-medium text-right">Pixel Index</th>
+                      <th className="py-2 px-4 font-medium text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-mono tabular-nums">
+                    {resolvedPickedPeaks.map(({ entry, trace, point }, idx) => (
+                      <tr key={entry.id} className="hover:bg-slate-50">
+                        <td className="py-2 px-4 text-slate-500">P{idx + 1}</td>
+                        {isMultiOverlay && (
+                          <td className="py-2 px-4 font-sans text-slate-800">
+                            <span className="inline-flex items-center gap-1.5">
+                              <span
+                                className="w-2.5 h-2.5 rounded-xs shrink-0 inline-block"
+                                style={{ backgroundColor: trace.color }}
+                              />
+                              <span className="truncate max-w-[190px]">{trace.fileName}</span>
+                            </span>
+                          </td>
+                        )}
+                        <td className="py-2 px-4 font-semibold" style={{ color: trace.color }}>
+                          {point.x.toFixed(effectiveUnit === 'electronVolt' ? 4 : 2)}
+                        </td>
+                        <td className="py-2 px-4 text-right text-slate-900">
+                          {isMultiOverlay && normalizeOverlay
+                            ? `${point.y.toFixed(1)}%`
+                            : point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-2 px-4 text-right text-slate-500">{point.origIdx}</td>
+                        <td className="py-2 px-4 text-right">
+                          <button
+                            type="button"
+                            onClick={() => removePickedPeak(entry.id)}
+                            aria-label={`Remove annotated peak at ${point.x.toFixed(2)}`}
+                            className="inline-flex items-center justify-center p-1 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer transition-colors"
+                          >
+                            <X className="w-3.5 h-3.5" aria-hidden="true" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
           {/* Detected Peaks Table + Optional White-Light Image */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className={`${whiteLightUrl && !isMultiOverlay ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
@@ -1610,6 +2291,15 @@ export function SpectrumView({
         )}
           </div>
         </>
+      )}
+
+      {arithmeticModalOpen && onCreateDerivedSample && (
+        <DataArithmeticModal
+          samples={samples}
+          activeSampleId={activeSampleId}
+          onClose={() => setArithmeticModalOpen(false)}
+          onCreateSample={onCreateDerivedSample}
+        />
       )}
     </div>
   );
