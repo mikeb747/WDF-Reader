@@ -1,0 +1,5 @@
+﻿Creating and writing to wdf files
+Utilities\WiREDataFormats\WiREDataFormats.csproj is a C# library for manipulating wdf files. 
+To create a new file and simply add spectrum data to you can use the Create New method. An example from Time Resolved Raman is included below.  It creates a new WDF file, reserving space according to the specified spectrum capacity, and the specified X-list and Y-list lengths.
+Note that yList does not refer to the spectrum data, it is related to a spectral image that can be collected with the data. So if you want to just record the intensity data then set yListLength to 1 and add the data using wdfFile.SpectrumCollection.WriteSpectrum(spectrumIndex, dataArray). Also note that the data needs to be in float. 
+

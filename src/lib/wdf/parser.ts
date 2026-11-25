@@ -599,7 +599,8 @@ export function parseWdf(
             const charCount = pset['MeasurementScript'].length;
             pset['MeasurementScript'] = `<VBScript ${charCount.toLocaleString()} chars — omitted from property tree>`;
           }
-          propertySets[id] = pset;
+          const psetKey = id in propertySets ? `${id}#${uid}` : id;
+          propertySets[psetKey] = pset;
           parsed = true;
         }
         break;

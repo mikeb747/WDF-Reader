@@ -4,7 +4,7 @@ import { BlockMapView } from './components/BlockMapView';
 import { InstrumentView } from './components/InstrumentView';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import { Sidebar, TRACE_COLOR_PALETTE, type LoadedSample } from './components/Sidebar';
-import { SpectrumView, type BaselineStrength } from './components/SpectrumView';
+import { SpectrumView, type BaselineStrength, type SmoothStrength } from './components/SpectrumView';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { TypeScriptExportView } from './components/TypeScriptExportView';
 import { stripWdfExtension } from './lib/format';
@@ -156,6 +156,8 @@ export default function App() {
   const [targetUnit, setTargetUnit] = useState<SpectralTargetUnit>('native');
   const [baselineEnabled, setBaselineEnabled] = useState(false);
   const [baselineStrength, setBaselineStrength] = useState<BaselineStrength>('auto');
+  const [smoothEnabled, setSmoothEnabled] = useState(false);
+  const [smoothStrength, setSmoothStrength] = useState<SmoothStrength>('auto');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoadingSamples, setIsLoadingSamples] = useState(!IS_PWA_BUILD);
@@ -606,6 +608,10 @@ export default function App() {
               onToggleBaseline={() => setBaselineEnabled((prev) => !prev)}
               baselineStrength={baselineStrength}
               onChangeBaselineStrength={setBaselineStrength}
+              smoothEnabled={smoothEnabled}
+              onToggleSmooth={() => setSmoothEnabled((prev) => !prev)}
+              smoothStrength={smoothStrength}
+              onChangeSmoothStrength={setSmoothStrength}
               onToggleSampleVisible={handleToggleSampleVisible}
               onSetAllVisible={handleSetAllVisible}
               onChangeSampleColor={handleChangeSampleColor}

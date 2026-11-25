@@ -1,0 +1,7 @@
+﻿Accessing wdf file properties
+The following table describes how to access file properties for the spectral search libraries.
+fieldlocation in wdf fileWiREDataFormatsNotesscan typeheader.scanTypeIWdfFile.scanTypeThis is an enum. There doesn't seem to be a way to get a string from it. This is an issue because StreamLineHR is now called StreamHR...laser wavenumberheader.laserwavenumIWdfFile.LaserWaveNumberexposure time (ms)namedItems[Scan].ExposureTime*Should be in the header?
+Always in ms.laser powernamedItems[instrumentState].NDPercent*Note that this is the amount of the laser allowed through by the ND filters, and is nothing to do with the input laser power.
+Should be in header ?accumulationsheader.naccum
+namedItems[Scan].AccumulationsIWdfFile.AccumulationsPerSpectrumresponse cal on/offnamedItems[Scan].useResponse*analystheader.userIWdfFile.UserName*need to ask AS or PT how to get the namedItems psets out of the wdffile to get these fields. Then WiREDataFormats should be extended to easily expose these properties.
+

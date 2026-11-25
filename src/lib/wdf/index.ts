@@ -21,3 +21,9 @@ export {
   type SpectrumArithmeticInput,
   type SpectrumArithmeticResult,
 } from './arithmetic';
+export {
+  smoothSpectrumSavitzkyGolay,
+  autoSmoothSpectrum,
+  type SmoothOptions,
+  type AutoSmoothResult,
+} from './smoothing';

@@ -1,0 +1,68 @@
+﻿Hacking WDF files with wdfexplorer
+It is possible to inspect and modify wdf files using the built-in Tcl console in wdfexplorer. To do this it helps to have an understanding of Tcl itself and the file manipulation functions and knowledge of the Tcl wdf package functions.
+Step-by-step guide
+1. Open the target file using wdfexplorer.
+2. Enter Control-F2 to show the Tcl console.
+3. Enter Tcl commands
+
+Worked example
+This example shows the commands used to find the location of the measurement definition block (WXDM) and edit the block ID in-place so that WiRE will not depersist the measurement.
+Example session hacking WXDM block ID. 
+(WiRE.git) 2 % set pos [wdf::find_section $wdf WXDM 0]
+58811482
+(WiRE.git) 4 % close $::wdf::1(fd)
+(WiRE.git) 5 % set ::wdf::1(fd) [open $filename rb+]
+fileaafe050
+(WiRE.git) 6 % seek $::wdf::1(fd) $pos
+(WiRE.git) 7 % puts -nonewline $::wdf::1(fd) "w"
+(WiRE.git) 8 % close $::wdf::1(fd)
+The first command gets the location of the offset of the WXDM block in the file.
+As wdfexplorer uses a read-only memory-mapped file view we then close the application filehandle ( ::wdf::1(fd) denotes an element fd of a dictionary called 1 in the wdf namespace ) and replace it with a writable filehandle (rb+ means read-write binary mode).
+We then seek to the remembered location and write a single character to replace the WXDM to wXDM and close the file.
+wdfexplorer will show the new block but WiRE will show the file as having no measurement information.
+wdf package documentation
+Tcl WDF package commands
+wdf::open filename mode
+Open a wdf file and return a handle to be used with futher commands in this package. filename is the path to a wdf file and mode is a Tcl file mode (r, w, a, r+, r+b etc)
+ Expand source 
+set wdfHandle [wdf::open "c:/Data/Anadin2.wdf" r]
+wdf::close handle
+Close a wdf file handle.
+wdf::get handle key
+Get a wdf file property by name from an opened filehandle. This retrieves items from the wdf file header or file properties collection (WXDA block) such as title, time_start, nspectra, ncollected etc.
+ Expand source 
+% wdf::get $wdf title
+Streamline image acquisition 2
+wdf::exists handle key
+Returns true if the key exists as a file header field or file properties collection item.
+wdf::get_xlist handle ?track?
+Return a list of doubles containing the x-list data for the specified track. If track is not provided it defaults to track 0. The list will contain npoints values.
+wdf::get_spectrum handle index
+Get the spectrum data for the specified spectrum. index must be the index of a spectrum between 0 and nspectra. The list will contain npoints doubles. Note: it is not an error to request spectra over ncollected but the index must be under nspectra.
+wdf::enum_sections handle ?callback? ?varname?
+Enumerate the sections of a file calling the callback procedure for each section found. The callback is passed the handle, section file offset and the provided variable name (if given).
+ Expand source 
+proc callback {handle pos {custom {}}} {
+    upvar #0 $handle state
+    binary scan [read $state(fd) 16] a4iuwu id uid size
+    puts "$pos $id:$uid $size bytes"
+}
+wdf::enum_sections $wdf callback $wdf
+wdf::find_section handle section_id ?uid?
+Get the file offset for a selected section in the file. handle must be a filehandle as returned by wdf::open. section_id must be the id code for a wdf file section (eg: WXDA, "MAP ", WHTL) and uid is the optional id of the specific instance of a section.
+wdf::get_perdataset_pset handle index
+Get the pset for a specified spectrum.
+wdf::get_origin_value handle origin index
+Get the value for a specified data origin for the spectrum identified by index. origin must be one of the WdfDataType values and is used to select the specific data origin. Note it is NOT an array index.
+wdf::get_origin_range handle origin start last
+Get part or all of the data origin list data for a specified data origin.
+Data origins hold one value for each collected spectrum so start and last are spectrum indices for the range of interest. The result is binary data that must be parsed by the caller as each
+wdf::get_flags handle
+wdf::get_curvefit_result handle blockuid index
+wdf::get_map_item handle uid
+wdf::get_map_data map_item index count
+
+
+Related articles
+Filter by label
+There are no items with the selected labels at this time.

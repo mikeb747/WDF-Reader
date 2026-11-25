@@ -1,0 +1,28 @@
+﻿The wdf file format
+The wdf file format is WiRE's primary data format. It enables storage and efficient reading and writing of a rich variety of data.
+Wdf files consist of a set of blocks of memory. Low-level documentation on the file format can be found at WiRE.git\wdf\documentation:
+Header: is mandatory, and must be written first. It contains various data which is critical to the file.
+Other blocks contain information on the measurement, collected data and results of any processing. Key blocks are:
+DATA: Contains a set of spectra as arrays of numbers (their axes are stored separately in the XLST and YLST blocks)
+XLST: Contains the x-axis data which each acquired spectrum is plotted against (typical units cm-1)
+WXDM: Contains a serialized WiREExperiment2 COM object which describes all the information necessary to run an experiment on the spectrometer
+ORGN: Contains a number of sets of per-spectrum data. Example origins include x- and y-positions at which each spectrum was taken and the time at which it was taken. Each origin should contain a 1:1 mapping with the spectra in the DATA block. Origins are created only before a measurement begins (typically in WiREScanCom.h::InitializeDataOriginList). This is to aid efficiency in reading/writing to them. Each data point can be considered as a spectrum and a collection of points from the various origins. Each of these can be read with a single step command because the distance between origin values are always the same (which would not be guaranteed if were allowed to add origins).
+
+Utilities
+WiRE offers several utilities to help working with wdf files, which can be found in the WiRE install directory
+WdfExplorer enables the user to browse data in a wdf file
+WdfLint provides a set of verification tests to ensure the fidelity of a wdf file
+WdfSpectrumFlags bit definitions
+The flags value is a 64 bit integer with some bit ranges reserved and some parts used for per-spectrum status information.
+    +-------------------------------------------------------------------------------+
+    |    7         6         5         4         3         2         1         0    |
+    |....:....|....:....|....:....|....:....|....:....|....:....|....:....|....:....|
+     6  6 5  5 5  5 5  4 4  4 4  4 3  3 3  3 3  2 2  2 2  2 1  1 1  1 1             
+     3  0 9  6 5  2 1  8 7  4 3  0 9  6 5  2 1  8 7  4 3  0 9  6 5  2 1  8 7  4 3  0
+     
+     +-----------------+ +-------------------------------------+ +------------------+
+         custom (16)                     masks (32)                    flags(16)
+                                                                       (5 spare)
+
+Filter by label
+There are no items with the selected labels at this time.

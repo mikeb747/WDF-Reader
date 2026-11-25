@@ -11,6 +11,8 @@ import {
   autoSubtractBaseline,
   parseArithmeticExpression,
   computeSpectrumArithmetic,
+  smoothSpectrumSavitzkyGolay,
+  autoSmoothSpectrum,
   WdfBlockId,
   WdfDataType,
   WdfDataUnits,
@@ -471,6 +473,64 @@ test('computeSpectrumArithmetic evaluates 1-dataset and 2-dataset formulas accur
   // Rejects division by zero constant and invalid syntax
   assert.throws(() => parseArithmeticExpression('D1 / 0'), /zero/i);
   assert.throws(() => parseArithmeticExpression('D1 + * 5'), /unexpected/i);
+});
+
+test('smoothSpectrumSavitzkyGolay and autoSmoothSpectrum reduce high-frequency noise while preserving polynomials and peaks', () => {
+  // 1. Exact cubic polynomial reproduction including boundaries
+  const poly = new Float64Array(80);
+  for (let i = 0; i < poly.length; i++) {
+    const t = (i - 40) / 20;
+    poly[i] = 10 + 3 * t - 1.5 * t * t + 0.4 * t * t * t;
+  }
+  const polySmooth = smoothSpectrumSavitzkyGolay(poly, { windowSize: 15, polyOrder: 3 });
+  for (let i = 0; i < poly.length; i++) {
+    assert.ok(
+      Math.abs(polySmooth[i] - poly[i]) < 1e-8,
+      `Polynomial mismatch at idx ${i}: ${polySmooth[i]} vs ${poly[i]}`,
+    );
+  }
+
+  // 2. Noisy filter transmission plateau (0 -> 96% step with ±3% jitter like real edge-filter ratios)
+  const n = 2400;
+  const noisyFilter = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const step = 96 / (1 + Math.exp(-(i - 200) / 4));
+    const jitter = i > 220 ? Math.sin(i * 1.7) * 2.1 + Math.cos(i * 2.9) * 1.4 : Math.sin(i * 1.9) * 0.15;
+    noisyFilter[i] = step + jitter;
+  }
+  const autoRes = autoSmoothSpectrum(noisyFilter);
+  assert.ok(autoRes.windowSize >= 15, `Expected strong auto window >= 15, got ${autoRes.windowSize}`);
+
+  // Compute plateau standard deviation before vs after smoothing (indices 400..2200)
+  const plateauSlice = (arr: Float64Array) => {
+    let sum = 0;
+    let count = 0;
+    for (let i = 400; i < 2200; i++) {
+      sum += arr[i];
+      count++;
+    }
+    const mean = sum / count;
+    let varSum = 0;
+    for (let i = 400; i < 2200; i++) {
+      varSum += (arr[i] - mean) * (arr[i] - mean);
+    }
+    return { mean, std: Math.sqrt(varSum / count) };
+  };
+  const before = plateauSlice(noisyFilter);
+  const after = plateauSlice(autoRes.smoothed);
+  assert.ok(Math.abs(after.mean - 96) < 0.2, `Plateau mean drifted: ${after.mean}`);
+  assert.ok(after.std < before.std * 0.25, `Expected >75% noise reduction: ${before.std} -> ${after.std}`);
+
+  // 3. Preserves real Silicon 520 cm-1 peak center cleanly
+  const siWdf = parseWdf(fs.readFileSync(SAMPLE_520_PATH), { sortXAscending: true });
+  assert.ok(siWdf.xAxis);
+  const siY = getSpectrum(siWdf, 0);
+  const siAuto = autoSmoothSpectrum(siY);
+  let maxIdx = 0;
+  for (let i = 1; i < siAuto.smoothed.length; i++) {
+    if (siAuto.smoothed[i] > siAuto.smoothed[maxIdx]) maxIdx = i;
+  }
+  assert.ok(Math.abs(siWdf.xAxis.values[maxIdx] - 519.94) < 0.5);
 });
 
 test('rejects invalid or truncated inputs cleanly', () => {

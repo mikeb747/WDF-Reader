@@ -1,0 +1,265 @@
+﻿WDF File Format
+General format of a WDF file
+NOTE: when reading this document -- the wdf.h header file is the canonical resource.
+* General format of a WDF file 
+o WDF file header
+o Spectral data
+o Spectral Y-list
+o Spectral X-list
+o Data origins
+o Comment
+o WiRE data
+o WiRE per-dataset data
+o WiRE calibration state
+o WiRE instrument state
+o History item blocks
+o Analysis operations 
+* Map results
+* Curvefit block (CFAR)
+* Component Analysis (DCLS)
+* PCA result
+* Integrate
+* Peak pick
+o Processing operations 
+* BackupDataList
+* BaselineSubtraction
+* Differentiate
+* Smooth
+* Truncate
+* Zap
+* SpectralArithmetic
+* Classification results
+* Checksums
+* Property set persistence 
+o type
+o flags
+o key
+o data
+
+[file header]
+[spectral data]
+[y-list]
+[x-list]
+[data origin lists]
+[file user data]
+[per-spectrum user data]
+[image]
+[history block 1]
+.
+.
+[history block n]
+[termination record]
+All sections are WDF blocks which are variably sized sections that are always prefixed with a 4 byte block type, 4 byte block id and 8 byte size of block including the type and id fields. This arrangement permits alignment on 32bit or 64 bit boundaries.
+typedef struct WdfBlock {
+  uint32_t id;
+  uint32_t uid;
+  uint64_t size;
+} WdfBlock;
+WDF file header
+namesizetypecommentsignature4char[4]WDF1version4uint32_tversion (0)size8uint64_tsize of header (512 bytes)flags8uint64_tbit flagsuuid16uint32_t[4]a uuid set when this file is created (128 bits)checksum16uint32_t[4]space for a 128 bit checksumstatus4uint32_tstatus word for the data filenpoints4uint32_tnumber of points per spectrumnspectra8uint64_tnumber of spectranexpected8uint64_tnumber of spectra configurednaccum4uint32_tnumber of accumulationsylistcount4uint32_tnumber of y-list elements (if > 1 its an image)xlistcount4uint32_tnumber of elements in the x-listorigincount4uint32_tnumber of data origin listsylistoffset8uint64_toffset from start of file to ylist blockxlistoffset8uint64_toffset from start of file to xlist blockoriginoffset8uint64_toffset from start of header to origin blockcommentoffset8uint64_toffset to comment blocknextid4uint32_tnext block id to issuetype4uint32_tmeasurement typetime_start8uint64_tcollection start file as a FILETIMEtime_end8uint64_tcollection end time as a FILETIMEunits4uint32_tspectral data units (one of WdfDataUnits? )laserwavenum4floatlaser wavenumberspare48uint64_t[6]spare slotsuser32utf8_t[32]user name as nul terminated utf-8 stringtitle160utf8_t[160]measurement title as nul terminated utf-8 stringpadding48uint64_t[6]padding to 512 bytesfree32uint64_t[4]four 64 bit slots for use by 3rd partiesreserved32uint64_t[4]four 64bit slots reserved for use by WiRE?The header is a fixed size for a given version of this specification. Note that this structure is also a WdfBlock structure . We always begin with the file signature which is made up of the ASCII chars 'WDF1' as the block type. The uid member is then the version of this specification as an unsigned 32 bit integer. The size of the header also provides a version check and will help older versions find the data when presented with a newer header. Newer formats should always append fields to the older header structure for backwards compatability.
+Flags (64bits):
+WdfXYXY: data has a different x-list for each i-list. 
+WdfChecksum: checksum field should be checked? or the type (MD5/SHA-1/CRC-32) 
+WdfCosmicRayRemoval: cosmic-ray removal was enabled on the hardware 
+WdfLinefocusMapping: Renishaw line-focus mapping was enabled 
+WdfSaturation: Saturated datasets exist WdfFileBackup? : A complete backup file has been created
+Spectral data
+This is a sequence of 32 bit little-endian IEEE floating point values. The size of this block is given by the npoints and nspectra values from the file header. This is just the spectral intensity values. All other data (spatial X-lists, spatial Y-lists and other data origin values) are stored in the data origin vectors. This block begins with the identifier DATA\0\0\0\0 followed by the size of the block in bytes which is (nspectra * npoints * sizeof(float)). The spectral intensity data is then written in contiguous sequences of floats. For image data the spectral y-list will have multiple values and the header ylistcount will be greater than one. Data will be stored per collection with each row stored sequentially.
+'DATA\0\0\0\0' SIZE floats...
+Spectral Y-list
+The spectral y-list data is stored in its own block as below. The number of points in the y-list is SIZE / sizeof(float). The first 8 bytes of the block after the header are two uint32 words containing the type and the units
+'YLST\0\0\0\0' SIZE TYPE UNITS floats...
+Spectral X-list
+The spectral x-list will contain npoints values. Treat as per the YLST block.
+'XLST\0\0\0\0' SIZE TYPE UNITS floats...
+Data origins
+There may be 1..n data origin lists stored. These lists store one value per collected dataset so all data origin lists contain nspectra values.
+There will nearly always be a time origin list which stores the time of the collection for each dataset and a status list which will contain the status code for the dataset (a few collections in a map may fail). Addition list types are spatial values in X, Y and Z, temperature, focal coefficient and posibly others contributed by third parties. The type field is ORed with a bit flag (0x80000000) which marks the origin as an alternate origin when clear or non-alternate if set.
+'ORGN\0\0\0\0' SIZE COUNT
+[ TYPE UNITS LABEL values... ]
+
+ORGNverbatim labelSIZEsize of block in bytesCOUNTint32 number of data origins containedTYPEint32: enumerationUNITSint32: enumertionLABELutf8char[16]Comment
+The comment block contains a simple text document and permits free storage of any text data. If we want to make it look like a pset item then [u 0 0 size text] otherwise just slap in the utf8 encoded string.
+'TEXT\0\0\0\0' SIZE
+utf8 encoded string data
+WiRE data
+We have to provide a mechanism to record all data contained in current WiRE data files. All the fields that do not map into one of the header fields or one of the other blocks already described will be persisted into a single custom block using the property-set persistence methods described below.
+Currently the calibration state and instrument state are persisted as items under the general measurement but this can have their own blocks as they are always present.
+Blocks may be created larger that necessary so psets are persisted with the size in bytes as the first 4byte word of the pset stream.
+'WXDA\0\0\0\0' SIZE [psetmagic] [psetsize] [pset item] [pset item] ... [pset item]
+WiRE per-dataset data
+WiRE permits the storage of some information on a per-dataset basis. This has been used for the data origin values which will now be stored in data origin lists instead. However we may still need to provide such storage for custom labels or error information or images. Potentially there may be multiple values per dataset and for a million dataset collection we cannot expect to walk along the set to find the items pertaining to a particular dataset. Instead there must be an index that gives the offset within this block to the pset data for the dataset.
+'WXDB\0\0\0\0' SIZE
+[index]
+{[psetsize][pset items]} * nspectra
+The index is a vector or 64bit offsets from the start of the block into the pset-items sequence. The index size will be 8 * nspectra. To read the properties for dataset 1200, depersist (block_start + index[1200]). If the index for a give dataset's pset is 0 then there is no per-dataset data for that dataset.
+WiRE calibration state
+The calibration state persisted as a property set.
+'WXCS\0\0\0\0' SIZE
+[psetmagic] [psetsize] [pset items]
+WiRE instrument state
+Simply the instrument state object persisted to a pset property set.
+'WXIS\0\0\0\0' SIZE
+[psetmagic] [psetsize] [pset items]
+History item blocks
+All subsequent blocks are effectively third-party blocks. Each will have a tag word, id word and a 64 bit size. The parameters for such blocks may be defined by the author of the component but it is suggested that the property-set persistence mechanism is used to store parameters as this may be read by anyone without intimate knowledge of the specific component that owns the data block.
+
+1. Analysis 
+1. Maps
+2. Curvefit
+3. DCLS
+4. PCA
+5. Integrate
+6. Peak pick - nothing to do.
+2. Processing 
+1. BackupDataList
+2. BaselineSubtraction
+3. Differentiate
+4. Smooth
+5. Truncate
+6. Zap
+7. SpectralArithmetic
+3. Other 
+1. ZeroLevelAndDarkCurrent
+2. Checksum reset
+3. FileFormatConversion
+4. Assay
+5. CAP
+Analysis operations
+Map results
+To satisfy the requirement that we must retain all information from a WXD file in the new format we must store map results. We need to store the map dataset, label and the parameters used to generate the map. If this has an indirection to some analysis result - ie: a curvefit or a component result then we need to store an identifier for these as well. This suggests a requirement for a per-file monatomic incrementing indentifier counter to ensure each result block has a unique identity. We could store an offset for the indirection block but I am very keen to avoid offsets from one block to another. Such offsets make it hard to reorganize the file later on and move things around.
+'MAP ' ID SIZE
+[parameters]
+[r 1 0x8001 count values...]
+parameters is a set of pset items storing the map parameters. The result property is stored as the final item and is an array of floats layed out as a pset item.
+Curvefit block (CFAR)
+The curvefit block must store a set of curvefit initialization parameters and the results of applying this fit to the file data. As this operation is time consuming and a number of views may be made from the result we store this result in the file.
+The parameters are serialized into a property-set stream and the result data is a sequence of four floats per curve for each dataset and two additional floats (chi-squared and num-iterations) per fit.
+In the below description a,b,c,d are the 4 values per curve. For standard curves these are center, width, height, percent-gaussian. For polynomial curves (baseline) these are cubic, quadratic, slope, offset. The number of curves must be read from the persisted parameters in the pset or could be calculated from the size of the data section if necessary.
+'CFAR' ID SIZE
+[uint32:psetmagic] [uint32:psetsize] [byte[]:psetdata]
+[uint32:number of elements]
+[
+  [float:iterationcount float:chisquared [float:a float:b float:c float:d] ... [float:a float:b float:c float:d]
+]
+Component Analysis (DCLS)
+Component mapping analysis generates a set of scores per component and then yields one map per component and a lack of fit map for the set. We need to store the parameters, the component reference datalists and the result datalists as this operation can be slow. The DCLS block retains the parameters used and stores the components used in the data part of the section. As these may have different xlist values than the collected spectra we must store the number of points (the same for each component's x- and i-lists) and the x-list values followed by the i-list values. The number of components stored must be read from the pset values (the number of items in the Components collection).
+'DCLS' ID SIZE
+[parameters]
+[
+  [uint32:num_points] [float[]:xlist] [float[]:ilist]
+]
+PCA result
+'PCAR' ID SIZE
+Integrate
+I'm unconvinced that this should be stored in the file. The result of the integrate component is one value per region per dataset.
+'INTG' ID SIZE
+[parameters]
+[results]
+The results section is a vector of floats. {{region0 ... regionN} ...}
+Peak pick
+I am not keen to produce this at all as I consider it an error to have ever stored this analysis result. However if we must be able to reproduce every field from a WXD file must store this too. However this block is deprecated.
+'PEAK' ID SIZE
+[parameters]
+[results]
+The results items are tuples of {intensity area centre height highedge lowedge width}. If we store these as a pset there will be (7 * (4 + 4) * nspectra) bytes and we need to walk the serialized list to fetch items per dataset. Or we can store a vector of float-tuples (7 * 4 * nspectra) and be able to index directly. The latter seems advisable.
+Processing operations
+The processing operations in WiRE modify the i-list data in place. This means the result of these operations is already the i-list data and we only need to store the parameters for the operation in these blocks.
+In future we may be able to store the operation parameters and avoid modifying the data using processing pipelines. If we develop this it will likely need a different set of block IDs so the blocks defined here are WiRE compatability.
+BackupDataList
+When the data is first modified we make a backup of the file to a .wxbak file. A history item then records that this has been done to avoid repeating the process and it holds the path to this backup file.
+'BKP0\0\0\0\0' SIZE
+pset-size
+  {path:s}
+  {version:s}
+This pset will be {path:s}. The version item seems to be empty all the time. Possibly because the version will be as saved for the filehandler version field that is in the top-level.
+BaselineSubtraction
+Baseline subtraction stores a baseline type and a polynomial order and a set of points each of which has an X and Y floating-point value.
+'BAS0\0\0\0\0' SIZE
+pset-size
+  {baseline-type:i}
+  {polynomial-order:i}
+  {points:p[]
+    {{x:r}
+     {y:r}}}
+  {version:s}
+Differentiate
+Differentiation may use Savitsky-Golay or Simple modes. For simple there are no other parameters. For the Savitsky-Golay mode it needs to store the differentiation and polynomial orders and the window size.
+'DIF0\0\0\0\0' SIZE
+pset-size
+  {differentiation-order:i}
+  {polynomial-order:i}
+  {window-size:i}
+  {version:s}
+Smooth
+Smoothing only requires two parameters.
+'SMO0\0\0\0\0' SIZE
+pset-size
+  {polynomial-order:i}
+  {window-size:i}
+  {version:s}
+Truncate
+Truncation just holds the left and right x-list positions of the new data following the operation.
+'TRK0\0\0\0\0' SIZE
+pset-size
+  {left:r}
+  {right:r}
+  {version:s}
+This property set will be {left:r} {right:r}
+Zap
+Parameters are the fill type and a set of regions each of which has a start and end value as a floating-point x-list coordinate. There are unlikely to be large numbers of these.
+'ZAP0\0\0\0\0' SIZE
+pset-size
+  {filltype:i}
+  {regions:p[]
+    {{start:r}
+     {end:r}}}
+  {version:s}
+This pset will contain {filltype:i} and an array pset {regions:p[]} which holds an array of psets containing two paramters {{start:r} {end:r}}
+SpectralArithmetic
+Spectral arithmetic maintains a number of fixed properties many of which are unused depending upon other properties.
+'WSP0\0\0\0\0' SIZE
+pset-size
+  {function:i}       ; enum
+  {operation:i}      ; enum
+  {description:s}
+  {data-multiplier:q}
+  {auxiliary-data:p} ; LimitedClone dataset
+  {auxiliary-dataset:s}
+  {auxiliary-filename:s}
+  {axiliary-multiplier:q}
+  {version:s}
+Classification results
+Data block with pset followed by a colour map (number of entries stored as uint32_t followed by uint32_t values holding ARGB colour values) then followed by the result data. Result data is number of entries (uint64_t) and each entry is a 32 bit integer. Typically each result value corresponds to a collected spectrum so the number of results should match the number of collected spectra.
+'DISC\0\0\0\0' SIZE
+pset-size
+  {name:s}
+  {version:s} ?
+colour-map
+  [count values...]
+result-data
+  [count values...] 
+Checksums
+We record SHA1 checksums for all the blocks in the file. So that we do not have to read the entire file the user can just verify blocks that they use. The DATA block is handled separately as each spectrum has a checksum that is stored in the checksum data origin. The record for each block is just the 4 byte block id, 4 byte block uid and then the 20 bytes of the SHA1 checksum.
+'WCHK' 0 SIZE
+[ uint32_t count ]
+[ blockid blockuid 20-byte-hash ]
+Property set persistence
+Throughout the previous sections there are numerous places where we wish to store sets of name value pairs of various types. To support this we will use property-sets. Property sets are collections of key-value pairs with a type. They can be persisted to a portable stream representation.
+typeflagskeydata112variabletype
+A single byte tag that indicates the layout of the data segment
+tagdata type?boolean (8 bit integer)c8 bit integers16 bit integeri32 bit integerw64 bit integerrfloat (32 bit IEE single precision floating point)qdouble (64 bit IEEE double precision floating point)ttimestamp (Win32 FILETIME)ustring (32 bit length prefixed utf-8 encoded string)bbinary (32 bit length prefixed binary data)pnested property setkkey name (32bit length prefixed utf-8 encoded string)flags
+single byte for flags
+bitmeaning0x80array0x40compressed (zlib)0x20reserved (encryption?)0x10reserved (checksum?)0x08unused0x04unused0x02unused0x01unusedkey
+The name of the property is represented by a unique 16 bit integer. If the top bit is clear then this is a standard name defined in this specification. If not then the string for this key will be stored in the property-set itself. This detail ensures that for any property set only one instance of a name will exist. For nested property-sets the key entry will be in the topmost property-set.
+data
+The layout of this field depends on the type field. For types where the size is not implicit the first 4-byte word will be the size in bytes of data.
+For example the string "Hello" will be persisted as [u 0 1 5 Hello] which takes 13 bytes (1 byte type, 1 byte flag, 2 bytes key, 4 bytes data len, 5 bytes of utf-8 encoded string data). Note that a BSTR persistence currently would require 14 bytes (one 32 bit integer plus the unicode representation of the string) and the difference would increase with string length. An integer might be [i 0 2 32768] which requires 8 bytes.
+Keys are either stock keys (top bit clear) in which case the client library has the string representation or custom (top bit set) in which case the persistence stream will have key items appended to be read when required (as type 'k' items).
+For some values - in particular the measurement script data but possibly other binary values - we will want to compress the data. This can be done and marked using the compression flag. When this flag is set the first 4 bytes of the data will be the compressed size + 8. The second 4 bytes will be the uncompressed size and the compressed data will be appended.
+We could support encrypted values. If the encrypted bit is set then like the compression bit the first 4 bytes will be the size of the data followed by the data itself to be decrypted. If both compression and encryption flags are set then the compressions was done before encryption when storing the data. We would need to decide an algorithm or permit the second word to store an algorithm identity. I'd suggest RC4 as being the simplest if not especially strong. Otherwise AES. I'm not sure we need this though. The current checksum implementation is WiRE4? is to checksum whole blocks using SHA1 and store these in a special checksum block which can be itself checksummed and signed if necessary. The spectra are checksummed individually and the truncated SHA1 sum saved as a checksum data origin (first 8 bytes of the SHA1 sum). This appears sufficient.
+A checksum bit may (in the future) be used to indicate the first word is a 32 bit zlib compatible crc32 checksum of the data. If this is combined with compression or encryption then the crc32 will be the last operation before writing the data so the first word will be the crc32 value, then the size of the compressed or encrypted data, then the data itself.
+The array flag indicates an array of the given type. In this case the first 4 bytes stores the 32bit unsigned count giving the number of stored values in the array. The set of values is then appended.
+When storing a property set into any byte stream, the size of the set should be stored with the data so that it is clear when the reader has completed. This is typically done as a 32 bit integer prefix to the pset data stream.
+set data [persist_to_pset $object]
+puts -nonewline $stream [binary format iu [string length $data]]$data

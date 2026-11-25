@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Calculator, Crosshair, Layers, Maximize2, Minimize2, RotateCcw, Rows3, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { Calculator, Crosshair, Layers, Maximize2, Minimize2, RotateCcw, Rows3, SlidersHorizontal, Trash2, Waves, X } from 'lucide-react';
 import {
+  autoSmoothSpectrum,
   autoSubtractBaseline,
   convertXAxis,
   detectPeaks,
   getSpectrum,
+  smoothSpectrumSavitzkyGolay,
   subtractBaseline,
+  WdfDataUnits,
   type AutoBaselineResult,
+  type AutoSmoothResult,
   type SpectralTargetUnit,
   type WdfFile,
   type WdfPeak,
@@ -17,11 +21,22 @@ import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
 export type BaselineStrength = 'auto' | 'gentle' | 'standard' | 'aggressive';
+export type SmoothStrength = 'auto' | 'light' | 'medium' | 'strong' | 'veryStrong';
 
 const MANUAL_BASELINE_LAMBDA: Record<Exclude<BaselineStrength, 'auto'>, number> = {
   gentle: 1e6,
   standard: 1e5,
   aggressive: 1e4,
+};
+
+const MANUAL_SMOOTH_CONFIG: Record<
+  Exclude<SmoothStrength, 'auto'>,
+  { windowSize: number; polyOrder: number; label: string }
+> = {
+  light: { windowSize: 7, polyOrder: 3, label: 'Light (7 pts)' },
+  medium: { windowSize: 15, polyOrder: 3, label: 'Medium (15 pts)' },
+  strong: { windowSize: 25, polyOrder: 3, label: 'Strong (25 pts)' },
+  veryStrong: { windowSize: 41, polyOrder: 2, label: 'Very Strong (41 pts)' },
 };
 
 interface SpectrumViewProps {
@@ -35,6 +50,10 @@ interface SpectrumViewProps {
   onToggleBaseline: () => void;
   baselineStrength: BaselineStrength;
   onChangeBaselineStrength: (strength: BaselineStrength) => void;
+  smoothEnabled: boolean;
+  onToggleSmooth: () => void;
+  smoothStrength: SmoothStrength;
+  onChangeSmoothStrength: (strength: SmoothStrength) => void;
   onToggleSampleVisible: (id: string) => void;
   onSetAllVisible: (visible: boolean) => void;
   onChangeSampleColor: (id: string, color: string) => void;
@@ -43,19 +62,33 @@ interface SpectrumViewProps {
   onToggleFullscreen?: () => void;
 }
 
-const UNIT_OPTIONS: Array<{ id: SpectralTargetUnit; label: string }> = [
-  { id: 'native', label: 'Native' },
+const STANDARD_UNIT_OPTIONS: Array<{ id: Exclude<SpectralTargetUnit, 'native'>; label: string }> = [
   { id: 'ramanShift', label: 'Raman Shift' },
   { id: 'wavenumber', label: 'Abs. cm⁻¹' },
   { id: 'nanometre', label: 'Wavelength nm' },
   { id: 'electronVolt', label: 'Energy eV' },
 ];
 
-const CHART_WIDTH = 960;
-const CHART_HEIGHT = 400;
-const MARGIN = { top: 24, right: 24, bottom: 48, left: 72 };
-const PLOT_W = CHART_WIDTH - MARGIN.left - MARGIN.right;
-const PLOT_H = CHART_HEIGHT - MARGIN.top - MARGIN.bottom;
+function wdfUnitToTargetUnit(unit: WdfDataUnits | undefined): Exclude<SpectralTargetUnit, 'native'> | null {
+  switch (unit) {
+    case WdfDataUnits.RamanShift:
+      return 'ramanShift';
+    case WdfDataUnits.Wavenumber:
+      return 'wavenumber';
+    case WdfDataUnits.Nanometre:
+      return 'nanometre';
+    case WdfDataUnits.ElectronVolt:
+      return 'electronVolt';
+    default:
+      return null;
+  }
+}
+
+const DEFAULT_CHART_WIDTH = 960;
+const DEFAULT_CHART_HEIGHT = 400;
+const MARGIN_TOP = 8;
+const MARGIN_RIGHT = 8;
+const MARGIN_BOTTOM = 38;
 
 function niceTicks(min: number, max: number, count: number): number[] {
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return [min];
@@ -100,6 +133,8 @@ interface ComputedTrace {
   peaks: WdfPeak[];
   autoBaselineProfile?: AutoBaselineResult['profile'];
   autoBaselineLambda?: number;
+  smoothWindowSize?: number;
+  autoSmoothProfile?: AutoSmoothResult['profile'];
 }
 
 interface PickedPeakEntry {
@@ -123,6 +158,8 @@ function buildTrace(
   spectrumIndex: number,
   targetUnit: SpectralTargetUnit,
   sortAscending: boolean,
+  smoothEnabled: boolean,
+  smoothStrength: SmoothStrength,
   baselineEnabled: boolean,
   baselineStrength: BaselineStrength,
   normalize: boolean,
@@ -133,7 +170,7 @@ function buildTrace(
   const n = Math.min(converted.values.length, yRaw.length);
   if (n === 0) return null;
 
-  // Build ordered index array so AsLS runs sequentially along the plotted X direction
+  // Build ordered index array so smoothing and AsLS run sequentially along the plotted X direction
   const order: Array<{ x: number; rawY: number; origIdx: number }> = [];
   for (let i = 0; i < n; i++) {
     order.push({ x: converted.values[i], rawY: yRaw[i], origIdx: i });
@@ -145,6 +182,26 @@ function buildTrace(
   const orderedRawY = new Float64Array(order.length);
   for (let i = 0; i < order.length; i++) orderedRawY[i] = order[i].rawY;
 
+  let denoisedY: Float64Array = orderedRawY;
+  let smoothWindowSize: number | undefined;
+  let autoSmoothProfile: AutoSmoothResult['profile'] | undefined;
+
+  if (smoothEnabled) {
+    if (smoothStrength === 'auto') {
+      const res = autoSmoothSpectrum(orderedRawY);
+      denoisedY = res.smoothed;
+      smoothWindowSize = res.windowSize;
+      autoSmoothProfile = res.profile;
+    } else {
+      const cfg = MANUAL_SMOOTH_CONFIG[smoothStrength];
+      denoisedY = smoothSpectrumSavitzkyGolay(orderedRawY, {
+        windowSize: cfg.windowSize,
+        polyOrder: cfg.polyOrder,
+      });
+      smoothWindowSize = cfg.windowSize;
+    }
+  }
+
   let baselineArr: Float64Array;
   let workingY: Float64Array;
   let autoBaselineProfile: AutoBaselineResult['profile'] | undefined;
@@ -152,20 +209,20 @@ function buildTrace(
 
   if (baselineEnabled) {
     if (baselineStrength === 'auto') {
-      const res = autoSubtractBaseline(orderedRawY);
+      const res = autoSubtractBaseline(denoisedY);
       baselineArr = res.baseline;
       workingY = res.corrected;
       autoBaselineProfile = res.profile;
       autoBaselineLambda = res.lambda;
     } else {
       const lambda = MANUAL_BASELINE_LAMBDA[baselineStrength];
-      const res = subtractBaseline(orderedRawY, { lambda, p: 0.005, iterations: 10 });
+      const res = subtractBaseline(denoisedY, { lambda, p: 0.005, iterations: 10 });
       baselineArr = res.baseline;
       workingY = res.corrected;
     }
   } else {
     baselineArr = new Float64Array(order.length);
-    workingY = orderedRawY;
+    workingY = denoisedY;
   }
 
   // Optional 0-100% normalization for multi-file overlay comparison
@@ -236,6 +293,8 @@ function buildTrace(
     peaks,
     autoBaselineProfile,
     autoBaselineLambda,
+    smoothWindowSize,
+    autoSmoothProfile,
   };
 }
 
@@ -322,6 +381,10 @@ export function SpectrumView({
   onToggleBaseline,
   baselineStrength,
   onChangeBaselineStrength,
+  smoothEnabled,
+  onToggleSmooth,
+  smoothStrength,
+  onChangeSmoothStrength,
   onToggleSampleVisible,
   onSetAllVisible,
   onChangeSampleColor,
@@ -344,6 +407,11 @@ export function SpectrumView({
   const [snapToLocalPeak, setSnapToLocalPeak] = useState(true);
   const [pickedPeaks, setPickedPeaks] = useState<PickedPeakEntry[]>([]);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const plotAreaRef = useRef<HTMLDivElement | null>(null);
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({
+    width: DEFAULT_CHART_WIDTH,
+    height: DEFAULT_CHART_HEIGHT,
+  });
 
   const visibleSamples = useMemo(() => {
     return samples.filter((s) => s.visible);
@@ -351,6 +419,34 @@ export function SpectrumView({
 
   const isMultiOverlay = visibleSamples.length > 1;
   const allVisible = samples.length > 1 && visibleSamples.length === samples.length;
+
+  useEffect(() => {
+    const el = plotAreaRef.current;
+    if (!el) return;
+
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      const nextW = Math.max(360, Math.floor(rect.width));
+      const nextH = isFullscreen
+        ? Math.max(240, Math.floor(rect.height))
+        : Math.round(Math.min(460, Math.max(340, nextW * 0.40)));
+      setContainerSize((prev) =>
+        prev.width === nextW && prev.height === nextH ? prev : { width: nextW, height: nextH },
+      );
+    };
+
+    updateSize();
+    const raf = window.requestAnimationFrame(updateSize);
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.cancelAnimationFrame(raf);
+    }
+    const ro = new ResizeObserver(() => updateSize());
+    ro.observe(el);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [isFullscreen, visibleSamples.length]);
 
   useEffect(() => {
     setZoomRange(null);
@@ -384,6 +480,14 @@ export function SpectrumView({
     return distinctUnits.size > 1 ? 'ramanShift' : 'native';
   }, [isMultiOverlay, targetUnit, visibleSamples]);
 
+  const sharedNativeUnit = useMemo(() => {
+    if (visibleSamples.length === 0) return null;
+    const distinctUnits = new Set(visibleSamples.map((s) => s.wdf.xAxis?.units));
+    if (distinctUnits.size !== 1) return null;
+    const [onlyUnit] = Array.from(distinctUnits);
+    return wdfUnitToTargetUnit(onlyUnit);
+  }, [visibleSamples]);
+
   const traces = useMemo<ComputedTrace[]>(() => {
     const list: ComputedTrace[] = [];
     for (const sample of visibleSamples) {
@@ -395,6 +499,8 @@ export function SpectrumView({
         sample.id === activeSampleId ? spectrumIndex : 0,
         effectiveUnit,
         sortAscending,
+        smoothEnabled,
+        smoothStrength,
         baselineEnabled,
         baselineStrength,
         isMultiOverlay && normalizeOverlay,
@@ -408,6 +514,8 @@ export function SpectrumView({
     spectrumIndex,
     effectiveUnit,
     sortAscending,
+    smoothEnabled,
+    smoothStrength,
     baselineEnabled,
     baselineStrength,
     isMultiOverlay,
@@ -500,11 +608,13 @@ export function SpectrumView({
           const shiftedY = p.y + yOffset;
           if (shiftedY < yMin) yMin = shiftedY;
           if (shiftedY > yMax) yMax = shiftedY;
-          if (!isMultiOverlay && baselineEnabled && showFittedBaseline) {
+          if (!isMultiOverlay && (baselineEnabled || smoothEnabled) && showFittedBaseline) {
             if (p.rawY < yMin) yMin = p.rawY;
             if (p.rawY > yMax) yMax = p.rawY;
-            if (p.baselineY < yMin) yMin = p.baselineY;
-            if (p.baselineY > yMax) yMax = p.baselineY;
+            if (baselineEnabled) {
+              if (p.baselineY < yMin) yMin = p.baselineY;
+              if (p.baselineY > yMax) yMax = p.baselineY;
+            }
           }
         }
       }
@@ -524,17 +634,42 @@ export function SpectrumView({
         yMax: yMax + yPad,
       },
     };
-  }, [traces, zoomRange, isMultiOverlay, isAutoOffsetActive, baselineEnabled, showFittedBaseline]);
+  }, [traces, zoomRange, isMultiOverlay, isAutoOffsetActive, baselineEnabled, smoothEnabled, showFittedBaseline]);
 
   const getTraceYOffset = (traceId: string) =>
     isAutoOffsetActive ? (traceYOffsets.get(traceId) ?? 0) : 0;
 
+  const xTicks = useMemo(() => niceTicks(viewDomain.xMin, viewDomain.xMax, 7), [viewDomain.xMin, viewDomain.xMax]);
+  const yTicks = useMemo(() => niceTicks(viewDomain.yMin, viewDomain.yMax, 6), [viewDomain.yMin, viewDomain.yMax]);
+  const xStep = xTicks.length >= 2 ? Math.abs(xTicks[1] - xTicks[0]) : 1;
+  const yStep = yTicks.length >= 2 ? Math.abs(yTicks[1] - yTicks[0]) : 1;
+
+  const maxYTickChars = useMemo(() => {
+    let maxLen = 2;
+    for (const tick of yTicks) {
+      const len = formatTick(tick, yStep).length;
+      if (len > maxLen) maxLen = len;
+    }
+    return maxLen;
+  }, [yTicks, yStep]);
+
+  const chartWidth = containerSize.width;
+  const chartHeight = containerSize.height;
+  const margin = {
+    top: MARGIN_TOP,
+    right: MARGIN_RIGHT,
+    bottom: MARGIN_BOTTOM,
+    left: Math.max(46, Math.ceil(22 + maxYTickChars * 6.8 + 8)),
+  };
+  const plotW = Math.max(180, chartWidth - margin.left - margin.right);
+  const plotH = Math.max(140, chartHeight - margin.top - margin.bottom);
+
   const mapX = (x: number) =>
-    MARGIN.left + ((x - viewDomain.xMin) / (viewDomain.xMax - viewDomain.xMin)) * PLOT_W;
+    margin.left + ((x - viewDomain.xMin) / (viewDomain.xMax - viewDomain.xMin)) * plotW;
   const mapY = (y: number) =>
-    MARGIN.top + (1 - (y - viewDomain.yMin) / (viewDomain.yMax - viewDomain.yMin)) * PLOT_H;
+    margin.top + (1 - (y - viewDomain.yMin) / (viewDomain.yMax - viewDomain.yMin)) * plotH;
   const unmapX = (px: number) =>
-    viewDomain.xMin + ((px - MARGIN.left) / PLOT_W) * (viewDomain.xMax - viewDomain.xMin);
+    viewDomain.xMin + ((px - margin.left) / plotW) * (viewDomain.xMax - viewDomain.xMin);
 
   const tracePaths = useMemo(() => {
     const buildPath = (
@@ -557,7 +692,10 @@ export function SpectrumView({
     return traces.map((tr) => {
       const yOffset = isAutoOffsetActive ? (traceYOffsets.get(tr.id) ?? 0) : 0;
       const mainD = buildPath(tr.points, (p) => p.y + yOffset);
-      const rawD = !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.rawY) : '';
+      const rawD =
+        !isMultiOverlay && (baselineEnabled || smoothEnabled) && showFittedBaseline
+          ? buildPath(tr.points, (p) => p.rawY)
+          : '';
       const baseD =
         !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.baselineY) : '';
 
@@ -567,19 +705,27 @@ export function SpectrumView({
         if (visible.length >= 2) {
           const firstX = mapX(visible[0].x).toFixed(2);
           const lastX = mapX(visible[visible.length - 1].x).toFixed(2);
-          const baseY = (MARGIN.top + PLOT_H).toFixed(2);
+          const baseY = (margin.top + plotH).toFixed(2);
           areaD = `${mainD} L${lastX},${baseY} L${firstX},${baseY} Z`;
         }
       }
 
       return { trace: tr, mainD, rawD, baseD, areaD, yOffset };
     });
-  }, [traces, viewDomain, isMultiOverlay, isAutoOffsetActive, traceYOffsets, baselineEnabled, showFittedBaseline]);
-
-  const xTicks = useMemo(() => niceTicks(viewDomain.xMin, viewDomain.xMax, 7), [viewDomain.xMin, viewDomain.xMax]);
-  const yTicks = useMemo(() => niceTicks(viewDomain.yMin, viewDomain.yMax, 6), [viewDomain.yMin, viewDomain.yMax]);
-  const xStep = xTicks.length >= 2 ? Math.abs(xTicks[1] - xTicks[0]) : 1;
-  const yStep = yTicks.length >= 2 ? Math.abs(yTicks[1] - yTicks[0]) : 1;
+  }, [
+    traces,
+    viewDomain,
+    isMultiOverlay,
+    isAutoOffsetActive,
+    traceYOffsets,
+    baselineEnabled,
+    smoothEnabled,
+    showFittedBaseline,
+    margin.left,
+    margin.top,
+    plotW,
+    plotH,
+  ]);
 
   const getSvgCoords = (clientX: number, clientY: number): { x: number; y: number } | null => {
     const svg = svgRef.current;
@@ -597,8 +743,8 @@ export function SpectrumView({
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
     return {
-      x: ((clientX - rect.left) / rect.width) * CHART_WIDTH,
-      y: ((clientY - rect.top) / rect.height) * CHART_HEIGHT,
+      x: ((clientX - rect.left) / rect.width) * chartWidth,
+      y: ((clientY - rect.top) / rect.height) * chartHeight,
     };
   };
 
@@ -659,8 +805,8 @@ export function SpectrumView({
     const coords = getSvgCoords(e.clientX, e.clientY);
     if (!coords) return;
 
-    const clampedX = Math.max(MARGIN.left, Math.min(MARGIN.left + PLOT_W, coords.x));
-    const clampedY = Math.max(MARGIN.top, Math.min(MARGIN.top + PLOT_H, coords.y));
+    const clampedX = Math.max(margin.left, Math.min(margin.left + plotW, coords.x));
+    const clampedY = Math.max(margin.top, Math.min(margin.top + plotH, coords.y));
     if (dragSelection) {
       setDragSelection((prev) => (prev ? { ...prev, currentX: clampedX } : null));
     }
@@ -673,8 +819,8 @@ export function SpectrumView({
     if (e.button !== 0) return;
     const coords = getSvgCoords(e.clientX, e.clientY);
     if (!coords) return;
-    if (coords.x < MARGIN.left || coords.x > MARGIN.left + PLOT_W) return;
-    if (coords.y < MARGIN.top || coords.y > MARGIN.top + PLOT_H) return;
+    if (coords.x < margin.left || coords.x > margin.left + plotW) return;
+    if (coords.y < margin.top || coords.y > margin.top + plotH) return;
     setDragSelection({ startX: coords.x, currentX: coords.x, startY: coords.y });
   };
 
@@ -753,15 +899,15 @@ export function SpectrumView({
       const boxW = Math.max(76, maxChars * 6.4 + 14);
       const boxH = 30;
 
-      const minCenterX = MARGIN.left + boxW / 2 + 4;
-      const maxCenterX = MARGIN.left + PLOT_W - boxW / 2 - 4;
+      const minCenterX = margin.left + boxW / 2 + 4;
+      const maxCenterX = margin.left + plotW - boxW / 2 - 4;
       let boxCenterX = Math.max(minCenterX, Math.min(maxCenterX, px));
       let boxTop = py - boxH - 14;
       let sideAnchor: 'bottom' | 'left' | 'right' | 'top' = 'bottom';
 
       // When a tall peak apex is near the top edge, place the annotation cleanly to the side so the apex stays unobstructed
-      if (boxTop < MARGIN.top + 4) {
-        boxTop = Math.max(MARGIN.top + 6, Math.min(MARGIN.top + PLOT_H - boxH - 4, py - boxH / 2 + 6));
+      if (boxTop < margin.top + 4) {
+        boxTop = Math.max(margin.top + 6, Math.min(margin.top + plotH - boxH - 4, py - boxH / 2 + 6));
         const rightCenter = px + boxW / 2 + 16;
         const leftCenter = px - boxW / 2 - 16;
         if (rightCenter <= maxCenterX) {
@@ -782,11 +928,11 @@ export function SpectrumView({
         );
         if (!collides) break;
         const shiftedUp = boxTop - (boxH + 5);
-        if (shiftedUp >= MARGIN.top + 4) {
+        if (shiftedUp >= margin.top + 4) {
           boxTop = shiftedUp;
         } else {
           const shiftedDown = boxTop + (boxH + 5);
-          if (shiftedDown + boxH <= MARGIN.top + PLOT_H - 4) {
+          if (shiftedDown + boxH <= margin.top + plotH - 4) {
             boxTop = shiftedDown;
           } else {
             break;
@@ -823,7 +969,19 @@ export function SpectrumView({
         leaderEndY,
       };
     });
-  }, [resolvedPickedPeaks, viewDomain, effectiveUnit, isMultiOverlay, normalizeOverlay, isAutoOffsetActive, traceYOffsets]);
+  }, [
+    resolvedPickedPeaks,
+    viewDomain,
+    effectiveUnit,
+    isMultiOverlay,
+    normalizeOverlay,
+    isAutoOffsetActive,
+    traceYOffsets,
+    margin.left,
+    margin.top,
+    plotW,
+    plotH,
+  ]);
 
   const totalSpectra = Math.max(1, Math.floor(wdf.spectra.length / Math.max(1, wdf.header.pointsPerSpectrum)));
 
@@ -1020,12 +1178,12 @@ export function SpectrumView({
     <div
       className={
         isFullscreen
-          ? 'h-full flex flex-col p-3 lg:p-4 space-y-3 max-w-none'
-          : 'p-5 lg:p-6 space-y-5 max-w-[1400px]'
+          ? 'h-full flex flex-col px-1.5 py-1.5 sm:px-2 sm:py-2 space-y-1.5 max-w-none'
+          : 'px-2.5 py-2.5 sm:px-3 sm:py-3 space-y-4 max-w-none'
       }
     >
       {/* Header & Controls Bar */}
-      <div className={`space-y-3 border-b border-slate-200 ${isFullscreen ? 'pb-3 shrink-0' : 'pb-4'}`}>
+      <div className={`space-y-2.5 border-b border-slate-200 ${isFullscreen ? 'pb-2 shrink-0' : 'pb-3'}`}>
         {!isFullscreen && (
           <div className="min-w-0">
             <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">
@@ -1037,6 +1195,7 @@ export function SpectrumView({
               {isMultiOverlay ? (
                 <>
                   Comparing {traces.map((t) => t.fileName).join(' · ')} · Axis: {primaryTrace.label}
+                  {smoothEnabled ? ` · Denoised (${primaryTrace.smoothWindowSize ?? 15} pts)` : ''}
                   {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
                   {isAutoOffsetActive ? ' · Auto-Offset (Stacked)' : ''}
                 </>
@@ -1046,6 +1205,7 @@ export function SpectrumView({
                   {wdf.summary.laserWavenumberCm1
                     ? `Laser ${wdf.summary.laserWavenumberCm1.toFixed(2)} cm⁻¹ (${wdf.summary.laserWavelengthNm?.toFixed(2)} nm)`
                     : 'Laser wavenumber not specified'}
+                  {smoothEnabled ? ` · Denoised (${primaryTrace.smoothWindowSize ?? 15} pts)` : ''}
                   {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
                 </>
               )}
@@ -1053,7 +1213,7 @@ export function SpectrumView({
           </div>
         )}
 
-        {/* Unit Selector, Baseline Correction, Overlay Mode, Plot Toggles & Fullscreen */}
+        {/* Unit Selector, Remove Noise, Baseline Correction, Overlay Mode, Plot Toggles & Fullscreen */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <div
@@ -1061,13 +1221,15 @@ export function SpectrumView({
               aria-label="X-axis spectral units"
               className="inline-flex flex-wrap rounded border border-slate-200 bg-slate-100/80 p-0.5"
             >
-              {UNIT_OPTIONS.map((opt) => {
-                const active = effectiveUnit === opt.id;
+              {STANDARD_UNIT_OPTIONS.map((opt) => {
+                const isNativeOption = sharedNativeUnit === opt.id;
+                const active =
+                  effectiveUnit === opt.id || (effectiveUnit === 'native' && isNativeOption);
                 return (
                   <button
                     key={opt.id}
                     type="button"
-                    onClick={() => onChangeTargetUnit(opt.id)}
+                    onClick={() => onChangeTargetUnit(isNativeOption ? 'native' : opt.id)}
                     aria-pressed={active}
                     className={`px-2.5 py-1 text-xs font-medium rounded-sm whitespace-nowrap transition-colors cursor-pointer ${
                       active
@@ -1075,11 +1237,60 @@ export function SpectrumView({
                         : 'text-slate-600 hover:text-slate-900 border border-transparent'
                     }`}
                   >
-                    {opt.label}
+                    {isNativeOption ? `${opt.label} (Native)` : opt.label}
                   </button>
                 );
               })}
+              {!isMultiOverlay && sharedNativeUnit === null && (
+                <button
+                  type="button"
+                  onClick={() => onChangeTargetUnit('native')}
+                  aria-pressed={effectiveUnit === 'native'}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-sm whitespace-nowrap transition-colors cursor-pointer ${
+                    effectiveUnit === 'native'
+                      ? 'bg-white text-blue-600 border border-slate-200'
+                      : 'text-slate-600 hover:text-slate-900 border border-transparent'
+                  }`}
+                >
+                  {primaryTrace.label} (Native)
+                </button>
+              )}
             </div>
+
+            {/* Remove Noise (Savitzky-Golay Smoothing) Toggle + Strength */}
+            <button
+              type="button"
+              onClick={onToggleSmooth}
+              aria-pressed={smoothEnabled}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                smoothEnabled
+                  ? 'bg-blue-600 border-blue-600 text-white'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+              }`}
+              title="Apply Savitzky-Golay smoothing to reduce high-frequency spectral noise while preserving peaks and steep edges"
+            >
+              <Waves className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Remove Noise</span>
+            </button>
+
+            {smoothEnabled && (
+              <select
+                aria-label="Noise removal strength"
+                value={smoothStrength}
+                onChange={(e) => onChangeSmoothStrength(e.target.value as SmoothStrength)}
+                className="px-2 py-1.5 rounded border border-slate-200 bg-white text-xs text-slate-700 focus:outline-none focus:border-blue-600 cursor-pointer"
+              >
+                <option value="auto">
+                  {primaryTrace.smoothWindowSize
+                    ? `Auto (${primaryTrace.smoothWindowSize} pts)`
+                    : 'Auto (Detected)'}
+                </option>
+                <option value="light">{MANUAL_SMOOTH_CONFIG.light.label}</option>
+                <option value="medium">{MANUAL_SMOOTH_CONFIG.medium.label}</option>
+                <option value="strong">{MANUAL_SMOOTH_CONFIG.strong.label}</option>
+                <option value="veryStrong">{MANUAL_SMOOTH_CONFIG.veryStrong.label}</option>
+              </select>
+            )}
 
             {/* Auto-Baseline Toggle + Adaptive / Manual Mode */}
             <button
@@ -1212,7 +1423,7 @@ export function SpectrumView({
               </button>
             )}
 
-            {baselineEnabled && !isMultiOverlay && (
+            {(baselineEnabled || smoothEnabled) && !isMultiOverlay && (
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap">
                 <input
                   type="checkbox"
@@ -1220,7 +1431,7 @@ export function SpectrumView({
                   onChange={(e) => setShowFittedBaseline(e.target.checked)}
                   className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
                 />
-                <span>Show raw &amp; baseline</span>
+                <span>{baselineEnabled ? 'Show raw & baseline' : 'Show raw trace'}</span>
               </label>
             )}
 
@@ -1243,17 +1454,6 @@ export function SpectrumView({
               />
               <span>Sort X ascending</span>
             </label>
-
-            {zoomRange && (
-              <button
-                type="button"
-                onClick={() => setZoomRange(null)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 cursor-pointer whitespace-nowrap"
-              >
-                <RotateCcw className="w-3 h-3" aria-hidden="true" />
-                <span>Reset Zoom</span>
-              </button>
-            )}
 
             {onToggleFullscreen && (
               <button
@@ -1342,7 +1542,7 @@ export function SpectrumView({
         )}
 
         {/* Live Crosshair Readout Bar */}
-        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="font-mono tabular-nums text-slate-700 flex flex-wrap items-center gap-x-5 gap-y-1">
             {peakPickingMode && hoverPickCandidate ? (
               <>
@@ -1408,13 +1608,21 @@ export function SpectrumView({
                   </span>
                   <span>
                     <span className="text-slate-500 mr-1.5">
-                      {baselineEnabled ? 'Corrected:' : 'Intensity:'}
+                      {baselineEnabled ? 'Corrected:' : smoothEnabled ? 'Smoothed:' : 'Intensity:'}
                     </span>
                     <strong className="font-semibold text-slate-900">
                       {hoveredMatches[0].point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })}{' '}
                       {wdf.header.spectralUnitsName.toLowerCase()}
                     </strong>
                   </span>
+                  {smoothEnabled && !baselineEnabled && (
+                    <span className="text-slate-500">
+                      Raw:{' '}
+                      <span className="text-slate-700 font-medium">
+                        {hoveredMatches[0].point.rawY.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                      </span>
+                    </span>
+                  )}
                   {baselineEnabled && (
                     <span className="text-slate-500">
                       Baseline:{' '}
@@ -1438,20 +1646,22 @@ export function SpectrumView({
           </div>
 
           <div className="flex items-center gap-4 text-[11px] font-mono">
-            {baselineEnabled && !isMultiOverlay && showFittedBaseline && (
+            {(baselineEnabled || smoothEnabled) && !isMultiOverlay && showFittedBaseline && (
               <div className="flex items-center gap-3 text-slate-600">
                 <span className="inline-flex items-center gap-1">
                   <span className="w-3 h-0.5 inline-block" style={{ backgroundColor: primaryTrace.color }} />
-                  <span>Corrected</span>
+                  <span>{baselineEnabled ? 'Corrected' : 'Smoothed'}</span>
                 </span>
                 <span className="inline-flex items-center gap-1">
                   <span className="w-3 h-0.5 bg-slate-400 inline-block" />
                   <span>Raw</span>
                 </span>
-                <span className="inline-flex items-center gap-1">
-                  <span className="w-3 h-0.5 border-t border-dashed border-amber-600 inline-block" />
-                  <span>AsLS Baseline</span>
-                </span>
+                {baselineEnabled && (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-3 h-0.5 border-t border-dashed border-amber-600 inline-block" />
+                    <span>AsLS Baseline</span>
+                  </span>
+                )}
               </div>
             )}
             {zoomRange && (
@@ -1466,458 +1676,496 @@ export function SpectrumView({
         <div
           className={
             isFullscreen
-              ? 'flex-1 min-h-0 p-2 sm:p-3 flex items-center justify-center'
-              : 'p-2 sm:p-3'
+              ? 'flex-1 min-h-0 p-1 flex flex-col'
+              : 'p-1'
           }
         >
-          <svg
-            ref={svgRef}
-            viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-            preserveAspectRatio="xMidYMid meet"
+          <div
+            ref={plotAreaRef}
             className={
               isFullscreen
-                ? 'w-full h-full select-none cursor-crosshair block'
-                : 'w-full h-auto select-none cursor-crosshair block'
+                ? 'relative flex-1 min-h-0 w-full overflow-hidden'
+                : 'relative w-full'
             }
-            role="img"
-            aria-label={
-              isMultiOverlay
-                ? `Overlaid Raman spectra plot comparing ${traces.length} files`
-                : `Raman spectrum plot of ${primaryTrace.title || displayFileName}`
-            }
-            onPointerMove={handlePointerMove}
-            onPointerDown={handlePointerDown}
-            onPointerUp={handlePointerUp}
-            onPointerLeave={() => {
-              setHoverDataX(null);
-              setHoverSvgY(null);
-              setDragSelection(null);
-            }}
           >
-            <defs>
-              <linearGradient id="spectrumFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={primaryTrace.color} stopOpacity="0.14" />
-                <stop offset="100%" stopColor={primaryTrace.color} stopOpacity="0.01" />
-              </linearGradient>
-              <clipPath id="plotClip">
-                <rect x={MARGIN.left} y={MARGIN.top} width={PLOT_W} height={PLOT_H} />
-              </clipPath>
-            </defs>
+            {zoomRange && (
+              <button
+                type="button"
+                data-floating-reset-zoom="true"
+                onPointerDown={(e) => e.stopPropagation()}
+                onPointerUp={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setZoomRange(null);
+                }}
+                style={{ top: margin.top + 8, right: margin.right + 10 }}
+                className="absolute z-10 inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-slate-300 bg-white/95 hover:bg-slate-50 text-xs font-medium text-slate-700 shadow-xs cursor-pointer whitespace-nowrap transition-colors"
+                title="Reset X-axis zoom to full spectral range"
+              >
+                <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                <span>Reset Zoom</span>
+              </button>
+            )}
 
-            {/* Plot Background */}
-            <rect
-              x={MARGIN.left}
-              y={MARGIN.top}
-              width={PLOT_W}
-              height={PLOT_H}
-              fill="#FFFFFF"
-              stroke="#E2E8F0"
-              strokeWidth="1"
-            />
+            <svg
+              ref={svgRef}
+              width={isFullscreen ? undefined : chartWidth}
+              height={isFullscreen ? undefined : chartHeight}
+              viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+              preserveAspectRatio="none"
+              className={
+                isFullscreen
+                  ? 'absolute inset-0 w-full h-full select-none cursor-crosshair block'
+                  : 'w-full h-auto select-none cursor-crosshair block'
+              }
+              role="img"
+              aria-label={
+                isMultiOverlay
+                  ? `Overlaid Raman spectra plot comparing ${traces.length} files`
+                  : `Raman spectrum plot of ${primaryTrace.title || displayFileName}`
+              }
+              onPointerMove={handlePointerMove}
+              onPointerDown={handlePointerDown}
+              onPointerUp={handlePointerUp}
+              onPointerLeave={() => {
+                setHoverDataX(null);
+                setHoverSvgY(null);
+                setDragSelection(null);
+              }}
+            >
+              <defs>
+                <linearGradient id="spectrumFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={primaryTrace.color} stopOpacity="0.14" />
+                  <stop offset="100%" stopColor={primaryTrace.color} stopOpacity="0.01" />
+                </linearGradient>
+                <clipPath id="plotClip">
+                  <rect x={margin.left} y={margin.top} width={plotW} height={plotH} />
+                </clipPath>
+              </defs>
 
-            {/* Horizontal Gridlines & Y Ticks */}
-            {yTicks.map((tick) => {
-              const py = mapY(tick);
-              if (py < MARGIN.top - 1 || py > MARGIN.top + PLOT_H + 1) return null;
-              return (
-                <g key={`y-${tick}`}>
-                  <line
-                    x1={MARGIN.left}
-                    y1={py}
-                    x2={MARGIN.left + PLOT_W}
-                    y2={py}
-                    stroke="#F1F5F9"
-                    strokeWidth="1"
-                  />
-                  <line
-                    x1={MARGIN.left - 4}
-                    y1={py}
-                    x2={MARGIN.left}
-                    y2={py}
-                    stroke="#94A3B8"
-                    strokeWidth="1"
-                  />
-                  <text
-                    x={MARGIN.left - 8}
-                    y={py + 3.5}
-                    textAnchor="end"
-                    fontSize="11"
-                    fontFamily="IBM Plex Mono, monospace"
-                    fill="#475569"
-                  >
-                    {formatTick(tick, yStep)}
-                  </text>
-                </g>
-              );
-            })}
+              {/* Plot Background */}
+              <rect
+                x={margin.left}
+                y={margin.top}
+                width={plotW}
+                height={plotH}
+                fill="#FFFFFF"
+                stroke="#E2E8F0"
+                strokeWidth="1"
+              />
 
-            {/* Vertical Gridlines & X Ticks */}
-            {xTicks.map((tick) => {
-              const px = mapX(tick);
-              if (px < MARGIN.left - 1 || px > MARGIN.left + PLOT_W + 1) return null;
-              return (
-                <g key={`x-${tick}`}>
-                  <line
-                    x1={px}
-                    y1={MARGIN.top}
-                    x2={px}
-                    y2={MARGIN.top + PLOT_H}
-                    stroke="#F1F5F9"
-                    strokeWidth="1"
-                  />
-                  <line
-                    x1={px}
-                    y1={MARGIN.top + PLOT_H}
-                    x2={px}
-                    y2={MARGIN.top + PLOT_H + 4}
-                    stroke="#94A3B8"
-                    strokeWidth="1"
-                  />
-                  <text
-                    x={px}
-                    y={MARGIN.top + PLOT_H + 18}
-                    textAnchor="middle"
-                    fontSize="11"
-                    fontFamily="IBM Plex Mono, monospace"
-                    fill="#475569"
-                  >
-                    {formatTick(tick, xStep)}
-                  </text>
-                </g>
-              );
-            })}
-
-            {/* Clipped Data Layer */}
-            <g clipPath="url(#plotClip)">
-              {/* Zero reference line when baseline correction is active */}
-              {baselineEnabled && viewDomain.yMin < 0 && viewDomain.yMax > 0 && (
-                <line
-                  x1={MARGIN.left}
-                  y1={mapY(0)}
-                  x2={MARGIN.left + PLOT_W}
-                  y2={mapY(0)}
-                  stroke="#CBD5E1"
-                  strokeWidth="1"
-                />
-              )}
-
-              {/* Stacked Lane Baseline Guides & Inline Labels (Auto-Offset mode) */}
-              {isAutoOffsetActive &&
-                traces.map((tr) => {
-                  const guideY = traceBaselineGuides.get(tr.id);
-                  if (guideY === undefined) return null;
-                  const py = mapY(guideY);
-                  const xSpan = Math.max(1e-9, viewDomain.xMax - viewDomain.xMin);
-                  const leftGap = Math.max(0, tr.minX - viewDomain.xMin) / xSpan;
-                  const rightGap = Math.max(0, viewDomain.xMax - tr.maxX) / xSpan;
-                  let placeOnLeft = leftGap > rightGap + 0.03;
-                  if (Math.abs(leftGap - rightGap) <= 0.03) {
-                    const leftCut = viewDomain.xMin + xSpan * 0.25;
-                    const rightCut = viewDomain.xMax - xSpan * 0.25;
-                    let leftPeak = -Infinity;
-                    let rightPeak = -Infinity;
-                    for (let i = 0; i < tr.points.length; i++) {
-                      const pt = tr.points[i];
-                      if (pt.x >= viewDomain.xMin && pt.x <= leftCut && pt.y > leftPeak) leftPeak = pt.y;
-                      if (pt.x >= rightCut && pt.x <= viewDomain.xMax && pt.y > rightPeak) rightPeak = pt.y;
-                    }
-                    placeOnLeft = leftPeak < rightPeak;
-                  }
-                  return (
-                    <g key={`offset-lane-${tr.id}`} data-offset-lane={tr.id} pointerEvents="none">
-                      <line
-                        x1={MARGIN.left}
-                        y1={py}
-                        x2={MARGIN.left + PLOT_W}
-                        y2={py}
-                        stroke={tr.color}
-                        strokeWidth="1"
-                        strokeOpacity="0.22"
-                        strokeDasharray="4 4"
-                      />
-                      <text
-                        x={placeOnLeft ? MARGIN.left + 8 : MARGIN.left + PLOT_W - 8}
-                        y={Math.max(MARGIN.top + 12, py - 5)}
-                        textAnchor={placeOnLeft ? 'start' : 'end'}
-                        fontSize="10"
-                        fontFamily="IBM Plex Mono, monospace"
-                        fontWeight="600"
-                        fill={tr.color}
-                        stroke="#FFFFFF"
-                        strokeWidth="3"
-                        paintOrder="stroke"
-                      >
-                        {tr.fileName}
-                      </text>
-                    </g>
-                  );
-                })}
-
-              {/* Traces */}
-              {tracePaths.map(({ trace, mainD, rawD, baseD, areaD }) => (
-                <g key={trace.id} data-trace-id={trace.id}>
-                  {rawD && (
-                    <path
-                      d={rawD}
-                      fill="none"
+              {/* Horizontal Gridlines & Y Ticks */}
+              {yTicks.map((tick) => {
+                const py = mapY(tick);
+                if (py < margin.top - 1 || py > margin.top + plotH + 1) return null;
+                return (
+                  <g key={`y-${tick}`}>
+                    <line
+                      x1={margin.left}
+                      y1={py}
+                      x2={margin.left + plotW}
+                      y2={py}
+                      stroke="#F1F5F9"
+                      strokeWidth="1"
+                    />
+                    <line
+                      x1={margin.left - 4}
+                      y1={py}
+                      x2={margin.left}
+                      y2={py}
                       stroke="#94A3B8"
-                      strokeWidth="1.2"
-                      strokeOpacity="0.7"
-                      strokeLinejoin="round"
+                      strokeWidth="1"
                     />
-                  )}
-                  {baseD && (
-                    <path
-                      d={baseD}
-                      fill="none"
-                      stroke="#D97706"
-                      strokeWidth="1.5"
-                      strokeDasharray="5 3"
-                      strokeLinejoin="round"
-                    />
-                  )}
-                  {areaD && <path d={areaD} fill="url(#spectrumFill)" />}
-                  {mainD && (
-                    <path
-                      d={mainD}
-                      fill="none"
-                      stroke={trace.color}
-                      strokeWidth={isMultiOverlay ? '1.6' : '1.5'}
-                      strokeLinejoin="round"
-                      strokeLinecap="round"
-                    />
-                  )}
-                </g>
-              ))}
+                    <text
+                      x={margin.left - 7}
+                      y={py + 3.5}
+                      textAnchor="end"
+                      fontSize="11"
+                      fontFamily="IBM Plex Mono, monospace"
+                      fill="#475569"
+                    >
+                      {formatTick(tick, yStep)}
+                    </text>
+                  </g>
+                );
+              })}
 
-              {/* Drag-to-Zoom Selection Overlay */}
-              {dragSelection && Math.abs(dragSelection.currentX - dragSelection.startX) > 4 && (
-                <rect
-                  x={Math.min(dragSelection.startX, dragSelection.currentX)}
-                  y={MARGIN.top}
-                  width={Math.abs(dragSelection.currentX - dragSelection.startX)}
-                  height={PLOT_H}
-                  fill="#2563EB"
-                  fillOpacity="0.12"
-                  stroke="#2563EB"
-                  strokeWidth="1"
-                />
-              )}
+              {/* Vertical Gridlines & X Ticks */}
+              {xTicks.map((tick) => {
+                const px = mapX(tick);
+                if (px < margin.left - 1 || px > margin.left + plotW + 1) return null;
+                const nearRightEdge = px > margin.left + plotW - 24;
+                const nearLeftEdge = px < margin.left + 24;
+                const textAnchor = nearRightEdge ? 'end' : nearLeftEdge ? 'start' : 'middle';
+                const textX = nearRightEdge
+                  ? Math.min(px, margin.left + plotW)
+                  : nearLeftEdge
+                    ? Math.max(px, margin.left)
+                    : px;
+                return (
+                  <g key={`x-${tick}`}>
+                    <line
+                      x1={px}
+                      y1={margin.top}
+                      x2={px}
+                      y2={margin.top + plotH}
+                      stroke="#F1F5F9"
+                      strokeWidth="1"
+                    />
+                    <line
+                      x1={px}
+                      y1={margin.top + plotH}
+                      x2={px}
+                      y2={margin.top + plotH + 4}
+                      stroke="#94A3B8"
+                      strokeWidth="1"
+                    />
+                    <text
+                      x={textX}
+                      y={margin.top + plotH + 16}
+                      textAnchor={textAnchor}
+                      fontSize="11"
+                      fontFamily="IBM Plex Mono, monospace"
+                      fill="#475569"
+                    >
+                      {formatTick(tick, xStep)}
+                    </text>
+                  </g>
+                );
+              })}
 
-              {/* Peak Callouts */}
-              {showPeaks &&
-                traces.map((tr) =>
-                  tr.peaks
-                    .filter((p) => p.x >= viewDomain.xMin && p.x <= viewDomain.xMax)
-                    .map((pk) => {
-                      const px = mapX(pk.x);
-                      const py = mapY(pk.intensity + getTraceYOffset(tr.id));
-                      // Suppress simple auto-label when user has already placed a detailed annotation on this peak
-                      const coveredByPicked = pickedAnnotationsLayout.some(
-                        (ann) => ann.trace.id === tr.id && Math.abs(ann.px - px) < 22,
-                      );
-                      if (coveredByPicked) return null;
-                      const labelY = Math.max(MARGIN.top + 14, py - 10);
-                      return (
-                        <g key={`${tr.id}-pk-${pk.index}`}>
-                          <line
-                            x1={px}
-                            y1={py}
-                            x2={px}
-                            y2={labelY + 3}
-                            stroke="#94A3B8"
-                            strokeWidth="1"
-                            strokeDasharray="2 2"
-                          />
-                          <circle cx={px} cy={py} r="3" fill="#FFFFFF" stroke={tr.color} strokeWidth="1.5" />
-                          <text
-                            x={px}
-                            y={labelY}
-                            textAnchor="middle"
-                            fontSize="10.5"
-                            fontFamily="IBM Plex Mono, monospace"
-                            fontWeight="500"
-                            fill={isMultiOverlay ? tr.color : '#0F172A'}
-                            stroke="#FFFFFF"
-                            strokeWidth="3"
-                            paintOrder="stroke"
-                          >
-                            {pk.x.toFixed(1)}
-                          </text>
-                        </g>
-                      );
-                    }),
+              {/* Clipped Data Layer */}
+              <g clipPath="url(#plotClip)">
+                {/* Zero reference line when baseline correction is active */}
+                {baselineEnabled && viewDomain.yMin < 0 && viewDomain.yMax > 0 && (
+                  <line
+                    x1={margin.left}
+                    y1={mapY(0)}
+                    x2={margin.left + plotW}
+                    y2={mapY(0)}
+                    stroke="#CBD5E1"
+                    strokeWidth="1"
+                  />
                 )}
 
-              {/* User-Picked Peak Annotations */}
-              {pickedAnnotationsLayout.map((ann) => (
-                <g
-                  key={ann.entry.id}
-                  data-picked-peak={ann.entry.id}
-                  className="cursor-pointer"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    removePickedPeak(ann.entry.id);
-                  }}
-                >
-                  <title>{`Annotated peak: ${ann.xLabel} (${ann.yLabel}) — Click label to remove`}</title>
-                  <line
-                    x1={ann.px}
-                    y1={ann.py}
-                    x2={ann.leaderEndX}
-                    y2={ann.leaderEndY}
-                    stroke={ann.trace.color}
-                    strokeWidth="1.25"
-                    strokeDasharray="3 2"
-                  />
-                  <circle
-                    cx={ann.px}
-                    cy={ann.py}
-                    r="4.2"
-                    fill={ann.trace.color}
-                    stroke="#FFFFFF"
-                    strokeWidth="1.6"
-                  />
-                  <rect
-                    x={ann.boxLeft}
-                    y={ann.boxTop}
-                    width={ann.boxW}
-                    height={ann.boxH}
-                    rx="3"
-                    fill="#FFFFFF"
-                    fillOpacity="0.96"
-                    stroke={ann.trace.color}
-                    strokeWidth="1.2"
-                  />
-                  <text
-                    x={ann.boxCenterX}
-                    y={ann.boxTop + 12}
-                    textAnchor="middle"
-                    fontSize="10"
-                    fontFamily="IBM Plex Mono, monospace"
-                    fontWeight="600"
-                    fill="#0F172A"
-                  >
-                    {ann.xLabel}
-                  </text>
-                  <text
-                    x={ann.boxCenterX}
-                    y={ann.boxTop + 24}
-                    textAnchor="middle"
-                    fontSize="9.5"
-                    fontFamily="IBM Plex Mono, monospace"
-                    fontWeight="500"
-                    fill="#475569"
-                  >
-                    {ann.yLabel}
-                  </text>
-                </g>
-              ))}
+                {/* Stacked Lane Baseline Guides & Inline Labels (Auto-Offset mode) */}
+                {isAutoOffsetActive &&
+                  traces.map((tr) => {
+                    const guideY = traceBaselineGuides.get(tr.id);
+                    if (guideY === undefined) return null;
+                    const py = mapY(guideY);
+                    const xSpan = Math.max(1e-9, viewDomain.xMax - viewDomain.xMin);
+                    const leftGap = Math.max(0, tr.minX - viewDomain.xMin) / xSpan;
+                    const rightGap = Math.max(0, viewDomain.xMax - tr.maxX) / xSpan;
+                    let placeOnLeft = leftGap > rightGap + 0.03;
+                    if (Math.abs(leftGap - rightGap) <= 0.03) {
+                      const leftCut = viewDomain.xMin + xSpan * 0.25;
+                      const rightCut = viewDomain.xMax - xSpan * 0.25;
+                      let leftPeak = -Infinity;
+                      let rightPeak = -Infinity;
+                      for (let i = 0; i < tr.points.length; i++) {
+                        const pt = tr.points[i];
+                        if (pt.x >= viewDomain.xMin && pt.x <= leftCut && pt.y > leftPeak) leftPeak = pt.y;
+                        if (pt.x >= rightCut && pt.x <= viewDomain.xMax && pt.y > rightPeak) rightPeak = pt.y;
+                      }
+                      placeOnLeft = leftPeak < rightPeak;
+                    }
+                    return (
+                      <g key={`offset-lane-${tr.id}`} data-offset-lane={tr.id} pointerEvents="none">
+                        <line
+                          x1={margin.left}
+                          y1={py}
+                          x2={margin.left + plotW}
+                          y2={py}
+                          stroke={tr.color}
+                          strokeWidth="1"
+                          strokeOpacity="0.22"
+                          strokeDasharray="4 4"
+                        />
+                        <text
+                          x={placeOnLeft ? margin.left + 8 : margin.left + plotW - 8}
+                          y={Math.max(margin.top + 12, py - 5)}
+                          textAnchor={placeOnLeft ? 'start' : 'end'}
+                          fontSize="10"
+                          fontFamily="IBM Plex Mono, monospace"
+                          fontWeight="600"
+                          fill={tr.color}
+                          stroke="#FFFFFF"
+                          strokeWidth="3"
+                          paintOrder="stroke"
+                        >
+                          {tr.fileName}
+                        </text>
+                      </g>
+                    );
+                  })}
 
-              {/* Crosshair Lines & Snap Dots */}
-              {hoverDataX !== null && hoveredMatches.length > 0 && (
-                <g pointerEvents="none">
-                  <line
-                    x1={mapX(
-                      peakPickingMode && hoverPickCandidate
-                        ? hoverPickCandidate.point.x
-                        : isMultiOverlay
-                          ? hoverDataX
-                          : hoveredMatches[0].point.x,
+                {/* Traces */}
+                {tracePaths.map(({ trace, mainD, rawD, baseD, areaD }) => (
+                  <g key={trace.id} data-trace-id={trace.id}>
+                    {rawD && (
+                      <path
+                        d={rawD}
+                        fill="none"
+                        stroke="#94A3B8"
+                        strokeWidth="1.2"
+                        strokeOpacity="0.7"
+                        strokeLinejoin="round"
+                      />
                     )}
-                    y1={MARGIN.top}
-                    x2={mapX(
-                      peakPickingMode && hoverPickCandidate
-                        ? hoverPickCandidate.point.x
-                        : isMultiOverlay
-                          ? hoverDataX
-                          : hoveredMatches[0].point.x,
+                    {baseD && (
+                      <path
+                        d={baseD}
+                        fill="none"
+                        stroke="#D97706"
+                        strokeWidth="1.5"
+                        strokeDasharray="5 3"
+                        strokeLinejoin="round"
+                      />
                     )}
-                    y2={MARGIN.top + PLOT_H}
-                    stroke={peakPickingMode ? '#2563EB' : '#64748B'}
+                    {areaD && <path d={areaD} fill="url(#spectrumFill)" />}
+                    {mainD && (
+                      <path
+                        d={mainD}
+                        fill="none"
+                        stroke={trace.color}
+                        strokeWidth={isMultiOverlay ? '1.6' : '1.5'}
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                      />
+                    )}
+                  </g>
+                ))}
+
+                {/* Drag-to-Zoom Selection Overlay */}
+                {dragSelection && Math.abs(dragSelection.currentX - dragSelection.startX) > 4 && (
+                  <rect
+                    x={Math.min(dragSelection.startX, dragSelection.currentX)}
+                    y={margin.top}
+                    width={Math.abs(dragSelection.currentX - dragSelection.startX)}
+                    height={plotH}
+                    fill="#2563EB"
+                    fillOpacity="0.12"
+                    stroke="#2563EB"
                     strokeWidth="1"
-                    strokeDasharray="3 3"
                   />
-                  {(!isMultiOverlay || (peakPickingMode && hoverPickCandidate)) && (
+                )}
+
+                {/* Peak Callouts */}
+                {showPeaks &&
+                  traces.map((tr) =>
+                    tr.peaks
+                      .filter((p) => p.x >= viewDomain.xMin && p.x <= viewDomain.xMax)
+                      .map((pk) => {
+                        const px = mapX(pk.x);
+                        const py = mapY(pk.intensity + getTraceYOffset(tr.id));
+                        // Suppress simple auto-label when user has already placed a detailed annotation on this peak
+                        const coveredByPicked = pickedAnnotationsLayout.some(
+                          (ann) => ann.trace.id === tr.id && Math.abs(ann.px - px) < 22,
+                        );
+                        if (coveredByPicked) return null;
+                        const labelY = Math.max(margin.top + 14, py - 10);
+                        return (
+                          <g key={`${tr.id}-pk-${pk.index}`}>
+                            <line
+                              x1={px}
+                              y1={py}
+                              x2={px}
+                              y2={labelY + 3}
+                              stroke="#94A3B8"
+                              strokeWidth="1"
+                              strokeDasharray="2 2"
+                            />
+                            <circle cx={px} cy={py} r="3" fill="#FFFFFF" stroke={tr.color} strokeWidth="1.5" />
+                            <text
+                              x={px}
+                              y={labelY}
+                              textAnchor="middle"
+                              fontSize="10.5"
+                              fontFamily="IBM Plex Mono, monospace"
+                              fontWeight="500"
+                              fill={isMultiOverlay ? tr.color : '#0F172A'}
+                              stroke="#FFFFFF"
+                              strokeWidth="3"
+                              paintOrder="stroke"
+                            >
+                              {pk.x.toFixed(1)}
+                            </text>
+                          </g>
+                        );
+                      }),
+                  )}
+
+                {/* User-Picked Peak Annotations */}
+                {pickedAnnotationsLayout.map((ann) => (
+                  <g
+                    key={ann.entry.id}
+                    data-picked-peak={ann.entry.id}
+                    className="cursor-pointer"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removePickedPeak(ann.entry.id);
+                    }}
+                  >
+                    <title>{`Annotated peak: ${ann.xLabel} (${ann.yLabel}) — Click label to remove`}</title>
                     <line
-                      x1={MARGIN.left}
-                      y1={mapY(
+                      x1={ann.px}
+                      y1={ann.py}
+                      x2={ann.leaderEndX}
+                      y2={ann.leaderEndY}
+                      stroke={ann.trace.color}
+                      strokeWidth="1.25"
+                      strokeDasharray="3 2"
+                    />
+                    <circle
+                      cx={ann.px}
+                      cy={ann.py}
+                      r="4.2"
+                      fill={ann.trace.color}
+                      stroke="#FFFFFF"
+                      strokeWidth="1.6"
+                    />
+                    <rect
+                      x={ann.boxLeft}
+                      y={ann.boxTop}
+                      width={ann.boxW}
+                      height={ann.boxH}
+                      rx="3"
+                      fill="#FFFFFF"
+                      fillOpacity="0.96"
+                      stroke={ann.trace.color}
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x={ann.boxCenterX}
+                      y={ann.boxTop + 12}
+                      textAnchor="middle"
+                      fontSize="10"
+                      fontFamily="IBM Plex Mono, monospace"
+                      fontWeight="600"
+                      fill="#0F172A"
+                    >
+                      {ann.xLabel}
+                    </text>
+                    <text
+                      x={ann.boxCenterX}
+                      y={ann.boxTop + 24}
+                      textAnchor="middle"
+                      fontSize="9.5"
+                      fontFamily="IBM Plex Mono, monospace"
+                      fontWeight="500"
+                      fill="#475569"
+                    >
+                      {ann.yLabel}
+                    </text>
+                  </g>
+                ))}
+
+                {/* Crosshair Lines & Snap Dots */}
+                {hoverDataX !== null && hoveredMatches.length > 0 && (
+                  <g pointerEvents="none">
+                    <line
+                      x1={mapX(
                         peakPickingMode && hoverPickCandidate
-                          ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
-                          : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                          ? hoverPickCandidate.point.x
+                          : isMultiOverlay
+                            ? hoverDataX
+                            : hoveredMatches[0].point.x,
                       )}
-                      x2={MARGIN.left + PLOT_W}
-                      y2={mapY(
+                      y1={margin.top}
+                      x2={mapX(
                         peakPickingMode && hoverPickCandidate
-                          ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
-                          : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                          ? hoverPickCandidate.point.x
+                          : isMultiOverlay
+                            ? hoverDataX
+                            : hoveredMatches[0].point.x,
                       )}
+                      y2={margin.top + plotH}
                       stroke={peakPickingMode ? '#2563EB' : '#64748B'}
                       strokeWidth="1"
                       strokeDasharray="3 3"
                     />
-                  )}
-                  {peakPickingMode && hoverPickCandidate ? (
-                    <g>
-                      <circle
-                        cx={mapX(hoverPickCandidate.point.x)}
-                        cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
-                        r="7"
-                        fill="none"
-                        stroke={hoverPickCandidate.trace.color}
-                        strokeWidth="1.5"
-                        strokeDasharray="2 2"
+                    {(!isMultiOverlay || (peakPickingMode && hoverPickCandidate)) && (
+                      <line
+                        x1={margin.left}
+                        y1={mapY(
+                          peakPickingMode && hoverPickCandidate
+                            ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
+                            : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                        )}
+                        x2={margin.left + plotW}
+                        y2={mapY(
+                          peakPickingMode && hoverPickCandidate
+                            ? hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id)
+                            : hoveredMatches[0].point.y + getTraceYOffset(hoveredMatches[0].trace.id),
+                        )}
+                        stroke={peakPickingMode ? '#2563EB' : '#64748B'}
+                        strokeWidth="1"
+                        strokeDasharray="3 3"
                       />
-                      <circle
-                        cx={mapX(hoverPickCandidate.point.x)}
-                        cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
-                        r="3.5"
-                        fill={hoverPickCandidate.trace.color}
-                        stroke="#FFFFFF"
-                        strokeWidth="1.5"
-                      />
-                    </g>
-                  ) : (
-                    hoveredMatches.map(({ trace, point }) => (
-                      <circle
-                        key={`snap-${trace.id}`}
-                        cx={mapX(point.x)}
-                        cy={mapY(point.y + getTraceYOffset(trace.id))}
-                        r="4"
-                        fill={trace.color}
-                        stroke="#FFFFFF"
-                        strokeWidth="1.5"
-                      />
-                    ))
-                  )}
-                </g>
-              )}
-            </g>
+                    )}
+                    {peakPickingMode && hoverPickCandidate ? (
+                      <g>
+                        <circle
+                          cx={mapX(hoverPickCandidate.point.x)}
+                          cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
+                          r="7"
+                          fill="none"
+                          stroke={hoverPickCandidate.trace.color}
+                          strokeWidth="1.5"
+                          strokeDasharray="2 2"
+                        />
+                        <circle
+                          cx={mapX(hoverPickCandidate.point.x)}
+                          cy={mapY(hoverPickCandidate.point.y + getTraceYOffset(hoverPickCandidate.trace.id))}
+                          r="3.5"
+                          fill={hoverPickCandidate.trace.color}
+                          stroke="#FFFFFF"
+                          strokeWidth="1.5"
+                        />
+                      </g>
+                    ) : (
+                      hoveredMatches.map(({ trace, point }) => (
+                        <circle
+                          key={`snap-${trace.id}`}
+                          cx={mapX(point.x)}
+                          cy={mapY(point.y + getTraceYOffset(trace.id))}
+                          r="4"
+                          fill={trace.color}
+                          stroke="#FFFFFF"
+                          strokeWidth="1.5"
+                        />
+                      ))
+                    )}
+                  </g>
+                )}
+              </g>
 
-            {/* Axis Titles */}
-            <text
-              x={MARGIN.left + PLOT_W / 2}
-              y={CHART_HEIGHT - 8}
-              textAnchor="middle"
-              fontSize="12"
-              fontWeight="500"
-              fill="#334155"
-            >
-              {primaryTrace.label} {primaryTrace.symbol ? `(${primaryTrace.symbol})` : ''}
-            </text>
-            <text
-              x={16}
-              y={MARGIN.top + PLOT_H / 2}
-              textAnchor="middle"
-              fontSize="12"
-              fontWeight="500"
-              fill="#334155"
-              transform={`rotate(-90, 16, ${MARGIN.top + PLOT_H / 2})`}
-            >
-              {yAxisTitle}
-            </text>
-          </svg>
+              {/* Axis Titles */}
+              <text
+                x={margin.left + plotW / 2}
+                y={chartHeight - 5}
+                textAnchor="middle"
+                fontSize="12"
+                fontWeight="500"
+                fill="#334155"
+              >
+                {primaryTrace.label} {primaryTrace.symbol ? `(${primaryTrace.symbol})` : ''}
+              </text>
+              <text
+                x={12}
+                y={margin.top + plotH / 2}
+                textAnchor="middle"
+                fontSize="12"
+                fontWeight="500"
+                fill="#334155"
+                transform={`rotate(-90, 12, ${margin.top + plotH / 2})`}
+              >
+                {yAxisTitle}
+              </text>
+            </svg>
+          </div>
         </div>
       </div>
 
