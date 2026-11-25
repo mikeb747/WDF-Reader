@@ -10,6 +10,7 @@ import {
   type WdfPeak,
 } from '../lib/wdf';
 import type { LoadedSample } from './Sidebar';
+import { TraceColorPicker } from './TraceColorPicker';
 
 export type BaselineStrength = 'gentle' | 'standard' | 'aggressive';
 
@@ -18,8 +19,6 @@ const BASELINE_LAMBDA: Record<BaselineStrength, number> = {
   standard: 1e5,
   aggressive: 1e4,
 };
-
-const OVERLAY_PALETTE = ['#2563EB', '#0D9488', '#D97706', '#7C3AED', '#DC2626', '#0284C7'];
 
 interface SpectrumViewProps {
   samples: LoadedSample[];
@@ -32,10 +31,9 @@ interface SpectrumViewProps {
   onToggleBaseline: () => void;
   baselineStrength: BaselineStrength;
   onChangeBaselineStrength: (strength: BaselineStrength) => void;
-  overlayEnabled: boolean;
-  onToggleOverlay: () => void;
-  overlayIds: string[];
-  onToggleOverlaySample: (id: string) => void;
+  onToggleSampleVisible: (id: string) => void;
+  onSetAllVisible: (visible: boolean) => void;
+  onChangeSampleColor: (id: string, color: string) => void;
 }
 
 const UNIT_OPTIONS: Array<{ id: SpectralTargetUnit; label: string }> = [
@@ -136,7 +134,7 @@ function buildTrace(
     workingY = orderedRawY;
   }
 
-  // Optional 0-100% normalization for overlay comparison
+  // Optional 0-100% normalization for multi-file overlay comparison
   let scaleMin = 0;
   let scaleSpan = 1;
   if (normalize) {
@@ -230,10 +228,9 @@ export function SpectrumView({
   onToggleBaseline,
   baselineStrength,
   onChangeBaselineStrength,
-  overlayEnabled,
-  onToggleOverlay,
-  overlayIds,
-  onToggleOverlaySample,
+  onToggleSampleVisible,
+  onSetAllVisible,
+  onChangeSampleColor,
 }: SpectrumViewProps) {
   const [spectrumIndex, setSpectrumIndex] = useState(0);
   const [showPeaks, setShowPeaks] = useState(true);
@@ -245,6 +242,15 @@ export function SpectrumView({
   const [hoverDataX, setHoverDataX] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
+  const visibleSamples = useMemo(() => {
+    const ticked = samples.filter((s) => s.visible);
+    if (ticked.length > 0) return ticked;
+    return samples.filter((s) => s.id === activeSampleId);
+  }, [samples, activeSampleId]);
+
+  const isMultiOverlay = visibleSamples.length > 1;
+  const allVisible = samples.length > 1 && visibleSamples.length === samples.length;
+
   useEffect(() => {
     setZoomRange(null);
     setHoverDataX(null);
@@ -254,7 +260,7 @@ export function SpectrumView({
   useEffect(() => {
     setZoomRange(null);
     setHoverDataX(null);
-  }, [targetUnit, sortAscending, overlayEnabled, overlayIds, baselineEnabled, normalizeOverlay]);
+  }, [targetUnit, sortAscending, visibleSamples.length, baselineEnabled, normalizeOverlay]);
 
   // White-light optical image URL (if embedded in WHTL block)
   const whiteLightUrl = useMemo(() => {
@@ -271,76 +277,40 @@ export function SpectrumView({
     };
   }, [whiteLightUrl]);
 
-  const colorBySampleId = useMemo(() => {
-    const map = new Map<string, string>();
-    samples.forEach((s, idx) => {
-      map.set(s.id, OVERLAY_PALETTE[idx % OVERLAY_PALETTE.length]);
-    });
-    return map;
-  }, [samples]);
-
   const effectiveUnit: SpectralTargetUnit = useMemo(() => {
-    if (!overlayEnabled || targetUnit !== 'native') return targetUnit;
-    const selected = samples.filter((s) => overlayIds.includes(s.id));
-    const distinctUnits = new Set(selected.map((s) => s.wdf.xAxis?.units));
+    if (!isMultiOverlay || targetUnit !== 'native') return targetUnit;
+    const distinctUnits = new Set(visibleSamples.map((s) => s.wdf.xAxis?.units));
     return distinctUnits.size > 1 ? 'ramanShift' : 'native';
-  }, [overlayEnabled, targetUnit, samples, overlayIds]);
+  }, [isMultiOverlay, targetUnit, visibleSamples]);
 
   const traces = useMemo<ComputedTrace[]>(() => {
     const lambda = BASELINE_LAMBDA[baselineStrength];
-    if (overlayEnabled) {
-      const selected = samples.filter((s) => overlayIds.includes(s.id));
-      const toRender =
-        selected.length > 0
-          ? selected
-          : samples.filter((s) => s.id === activeSampleId);
-
-      const list: ComputedTrace[] = [];
-      for (const sample of toRender) {
-        const trace = buildTrace(
-          sample.id,
-          sample.fileName,
-          sample.wdf,
-          colorBySampleId.get(sample.id) ?? OVERLAY_PALETTE[0],
-          sample.id === activeSampleId ? spectrumIndex : 0,
-          effectiveUnit,
-          sortAscending,
-          baselineEnabled,
-          lambda,
-          normalizeOverlay,
-        );
-        if (trace) list.push(trace);
-      }
-      return list;
+    const list: ComputedTrace[] = [];
+    for (const sample of visibleSamples) {
+      const trace = buildTrace(
+        sample.id,
+        sample.fileName,
+        sample.wdf,
+        sample.color,
+        sample.id === activeSampleId ? spectrumIndex : 0,
+        effectiveUnit,
+        sortAscending,
+        baselineEnabled,
+        lambda,
+        isMultiOverlay && normalizeOverlay,
+      );
+      if (trace) list.push(trace);
     }
-
-    const single = buildTrace(
-      activeSampleId,
-      fileName,
-      wdf,
-      '#2563EB',
-      spectrumIndex,
-      targetUnit,
-      sortAscending,
-      baselineEnabled,
-      lambda,
-      false,
-    );
-    return single ? [single] : [];
+    return list;
   }, [
-    overlayEnabled,
-    samples,
-    overlayIds,
+    visibleSamples,
     activeSampleId,
-    fileName,
-    wdf,
-    colorBySampleId,
     spectrumIndex,
     effectiveUnit,
-    targetUnit,
     sortAscending,
     baselineEnabled,
     baselineStrength,
+    isMultiOverlay,
     normalizeOverlay,
   ]);
 
@@ -369,7 +339,7 @@ export function SpectrumView({
           found = true;
           if (p.y < yMin) yMin = p.y;
           if (p.y > yMax) yMax = p.y;
-          if (!overlayEnabled && baselineEnabled && showFittedBaseline) {
+          if (!isMultiOverlay && baselineEnabled && showFittedBaseline) {
             if (p.rawY < yMin) yMin = p.rawY;
             if (p.rawY > yMax) yMax = p.rawY;
             if (p.baselineY < yMin) yMin = p.baselineY;
@@ -389,7 +359,7 @@ export function SpectrumView({
       yMin: yMin - yPad * 0.35,
       yMax: yMax + yPad,
     };
-  }, [traces, zoomRange, overlayEnabled, baselineEnabled, showFittedBaseline]);
+  }, [traces, zoomRange, isMultiOverlay, baselineEnabled, showFittedBaseline]);
 
   const mapX = (x: number) =>
     MARGIN.left + ((x - viewDomain.xMin) / (viewDomain.xMax - viewDomain.xMin)) * PLOT_W;
@@ -418,12 +388,12 @@ export function SpectrumView({
 
     return traces.map((tr) => {
       const mainD = buildPath(tr.points, (p) => p.y);
-      const rawD = !overlayEnabled && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.rawY) : '';
+      const rawD = !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.rawY) : '';
       const baseD =
-        !overlayEnabled && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.baselineY) : '';
+        !isMultiOverlay && baselineEnabled && showFittedBaseline ? buildPath(tr.points, (p) => p.baselineY) : '';
 
       let areaD = '';
-      if (!overlayEnabled && mainD) {
+      if (!isMultiOverlay && mainD) {
         const visible = tr.points.filter((p) => p.x >= viewDomain.xMin && p.x <= viewDomain.xMax);
         if (visible.length >= 2) {
           const firstX = mapX(visible[0].x).toFixed(2);
@@ -435,7 +405,7 @@ export function SpectrumView({
 
       return { trace: tr, mainD, rawD, baseD, areaD };
     });
-  }, [traces, viewDomain, overlayEnabled, baselineEnabled, showFittedBaseline]);
+  }, [traces, viewDomain, isMultiOverlay, baselineEnabled, showFittedBaseline]);
 
   const xTicks = useMemo(() => niceTicks(viewDomain.xMin, viewDomain.xMax, 7), [viewDomain.xMin, viewDomain.xMax]);
   const yTicks = useMemo(() => niceTicks(viewDomain.yMin, viewDomain.yMax, 6), [viewDomain.yMin, viewDomain.yMax]);
@@ -517,21 +487,6 @@ export function SpectrumView({
     return { cols, rows, cells, minVal, maxVal };
   }, [wdf, totalSpectra]);
 
-  if (!primaryTrace) {
-    return (
-      <div className="p-6 text-sm text-slate-600">
-        No spectral X-axis (XLST) block found in this file.
-      </div>
-    );
-  }
-
-  const yAxisTitle =
-    overlayEnabled && normalizeOverlay
-      ? 'Normalized Intensity (%)'
-      : baselineEnabled
-        ? `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
-        : `Intensity (${wdf.header.spectralUnitsName})`;
-
   const combinedPeaks = useMemo(() => {
     const rows: Array<{ trace: ComputedTrace; peak: WdfPeak }> = [];
     for (const tr of traces) {
@@ -543,25 +498,40 @@ export function SpectrumView({
     return rows;
   }, [traces]);
 
+  if (!primaryTrace) {
+    return (
+      <div className="p-6 text-sm text-slate-600">
+        No spectral X-axis (XLST) block found in this file.
+      </div>
+    );
+  }
+
+  const yAxisTitle =
+    isMultiOverlay && normalizeOverlay
+      ? 'Normalized Intensity (%)'
+      : baselineEnabled
+        ? `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
+        : `Intensity (${wdf.header.spectralUnitsName})`;
+
   return (
     <div className="p-5 lg:p-6 space-y-5 max-w-[1400px]">
       {/* Header & Controls Bar */}
       <div className="space-y-3 border-b border-slate-200 pb-4">
         <div className="min-w-0">
           <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">
-            {overlayEnabled
-              ? `Overlay Comparison (${traces.length} ${traces.length === 1 ? 'spectrum' : 'spectra'})`
-              : wdf.header.title || fileName}
+            {isMultiOverlay
+              ? `Overlay Comparison (${traces.length} spectra)`
+              : primaryTrace.title || fileName}
           </h1>
           <p className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-            {overlayEnabled ? (
+            {isMultiOverlay ? (
               <>
                 Comparing {traces.map((t) => t.fileName).join(' · ')} · Axis: {primaryTrace.label}
                 {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
               </>
             ) : (
               <>
-                {fileName} · {wdf.header.pointsPerSpectrum.toLocaleString()} points ·{' '}
+                {primaryTrace.fileName} · {primaryTrace.points.length.toLocaleString()} points ·{' '}
                 {wdf.summary.laserWavenumberCm1
                   ? `Laser ${wdf.summary.laserWavenumberCm1.toFixed(2)} cm⁻¹ (${wdf.summary.laserWavelengthNm?.toFixed(2)} nm)`
                   : 'Laser wavenumber not specified'}
@@ -631,23 +601,23 @@ export function SpectrumView({
             {/* Overlay Comparison Toggle */}
             <button
               type="button"
-              onClick={onToggleOverlay}
+              onClick={() => onSetAllVisible(!allVisible && !isMultiOverlay)}
               disabled={samples.length < 2}
-              aria-pressed={overlayEnabled}
+              aria-pressed={isMultiOverlay}
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
-                overlayEnabled
+                isMultiOverlay
                   ? 'bg-blue-600 border-blue-600 text-white'
                   : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
               }`}
               title="Overlay two or more loaded WDF spectra on the same chart"
             >
               <Layers className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>{overlayEnabled ? `Overlay (${traces.length})` : 'Overlay Mode'}</span>
+              <span>{isMultiOverlay ? `Overlay (${traces.length})` : 'Overlay Mode'}</span>
             </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-4">
-            {baselineEnabled && !overlayEnabled && (
+            {baselineEnabled && !isMultiOverlay && (
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap">
                 <input
                   type="checkbox"
@@ -696,37 +666,39 @@ export function SpectrumView({
       {/* Main Spectrum Plot Card */}
       <div className="bg-white border border-slate-200 rounded">
         {/* Overlay Sample Selector Strip */}
-        {overlayEnabled && (
+        {isMultiOverlay && (
           <div className="px-4 py-2.5 bg-slate-50/90 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                 Overlaid Spectra
               </span>
-              {samples.map((sample) => {
-                const checked = overlayIds.includes(sample.id);
-                const swatch = colorBySampleId.get(sample.id) ?? OVERLAY_PALETTE[0];
-                return (
-                  <label
-                    key={sample.id}
-                    className="inline-flex items-center gap-1.5 text-xs text-slate-800 cursor-pointer select-none"
+              {samples.map((sample) => (
+                <div
+                  key={sample.id}
+                  className="inline-flex items-center gap-1.5 text-xs text-slate-800 select-none"
+                >
+                  <input
+                    type="checkbox"
+                    checked={sample.visible}
+                    aria-label={`Overlay ${sample.fileName}`}
+                    onChange={() => onToggleSampleVisible(sample.id)}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                  />
+                  <TraceColorPicker
+                    color={sample.color}
+                    fileName={sample.fileName}
+                    size="sm"
+                    onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
+                  />
+                  <span
+                    onClick={() => onToggleSampleVisible(sample.id)}
+                    className="font-mono text-[11px] truncate max-w-[230px] cursor-pointer"
+                    title={sample.fileName}
                   >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => onToggleOverlaySample(sample.id)}
-                      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-                    />
-                    <span
-                      className="w-2.5 h-2.5 rounded-xs shrink-0 inline-block"
-                      style={{ backgroundColor: swatch }}
-                      aria-hidden="true"
-                    />
-                    <span className="font-mono text-[11px] truncate max-w-[230px]" title={sample.fileName}>
-                      {sample.fileName}
-                    </span>
-                  </label>
-                );
-              })}
+                    {sample.fileName}
+                  </span>
+                </div>
+              ))}
             </div>
 
             <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer select-none whitespace-nowrap">
@@ -745,7 +717,7 @@ export function SpectrumView({
         <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="font-mono tabular-nums text-slate-700 flex flex-wrap items-center gap-x-5 gap-y-1">
             {hoveredMatches.length > 0 ? (
-              overlayEnabled ? (
+              isMultiOverlay ? (
                 <>
                   <span className="text-slate-500">
                     {primaryTrace.label}:{' '}
@@ -804,10 +776,10 @@ export function SpectrumView({
           </div>
 
           <div className="flex items-center gap-4 text-[11px] font-mono">
-            {baselineEnabled && !overlayEnabled && showFittedBaseline && (
+            {baselineEnabled && !isMultiOverlay && showFittedBaseline && (
               <div className="flex items-center gap-3 text-slate-600">
                 <span className="inline-flex items-center gap-1">
-                  <span className="w-3 h-0.5 bg-blue-600 inline-block" />
+                  <span className="w-3 h-0.5 inline-block" style={{ backgroundColor: primaryTrace.color }} />
                   <span>Corrected</span>
                 </span>
                 <span className="inline-flex items-center gap-1">
@@ -836,9 +808,9 @@ export function SpectrumView({
             className="w-full h-auto select-none cursor-crosshair block"
             role="img"
             aria-label={
-              overlayEnabled
+              isMultiOverlay
                 ? `Overlaid Raman spectra plot comparing ${traces.length} files`
-                : `Raman spectrum plot of ${wdf.header.title || fileName}`
+                : `Raman spectrum plot of ${primaryTrace.title || fileName}`
             }
             onPointerMove={handlePointerMove}
             onPointerDown={handlePointerDown}
@@ -850,8 +822,8 @@ export function SpectrumView({
           >
             <defs>
               <linearGradient id="spectrumFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#2563EB" stopOpacity="0.14" />
-                <stop offset="100%" stopColor="#2563EB" stopOpacity="0.01" />
+                <stop offset="0%" stopColor={primaryTrace.color} stopOpacity="0.14" />
+                <stop offset="100%" stopColor={primaryTrace.color} stopOpacity="0.01" />
               </linearGradient>
               <clipPath id="plotClip">
                 <rect x={MARGIN.left} y={MARGIN.top} width={PLOT_W} height={PLOT_H} />
@@ -984,7 +956,7 @@ export function SpectrumView({
                       d={mainD}
                       fill="none"
                       stroke={trace.color}
-                      strokeWidth={overlayEnabled ? '1.6' : '1.5'}
+                      strokeWidth={isMultiOverlay ? '1.6' : '1.5'}
                       strokeLinejoin="round"
                       strokeLinecap="round"
                     />
@@ -1034,7 +1006,7 @@ export function SpectrumView({
                             fontSize="10.5"
                             fontFamily="IBM Plex Mono, monospace"
                             fontWeight="500"
-                            fill={overlayEnabled ? tr.color : '#0F172A'}
+                            fill={isMultiOverlay ? tr.color : '#0F172A'}
                             stroke="#FFFFFF"
                             strokeWidth="3"
                             paintOrder="stroke"
@@ -1050,15 +1022,15 @@ export function SpectrumView({
               {hoverDataX !== null && hoveredMatches.length > 0 && (
                 <g>
                   <line
-                    x1={mapX(overlayEnabled ? hoverDataX : hoveredMatches[0].point.x)}
+                    x1={mapX(isMultiOverlay ? hoverDataX : hoveredMatches[0].point.x)}
                     y1={MARGIN.top}
-                    x2={mapX(overlayEnabled ? hoverDataX : hoveredMatches[0].point.x)}
+                    x2={mapX(isMultiOverlay ? hoverDataX : hoveredMatches[0].point.x)}
                     y2={MARGIN.top + PLOT_H}
                     stroke="#64748B"
                     strokeWidth="1"
                     strokeDasharray="3 3"
                   />
-                  {!overlayEnabled && (
+                  {!isMultiOverlay && (
                     <line
                       x1={MARGIN.left}
                       y1={mapY(hoveredMatches[0].point.y)}
@@ -1111,7 +1083,7 @@ export function SpectrumView({
       </div>
 
       {/* Multi-Spectrum Scrubber (single-file series / map) */}
-      {!overlayEnabled && totalSpectra > 1 && (
+      {!isMultiOverlay && totalSpectra > 1 && (
         <div className="bg-white border border-slate-200 rounded p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex-1">
             <label htmlFor="spectrum-scrubber" className="block text-xs font-medium text-slate-700 mb-1.5">
@@ -1180,7 +1152,7 @@ export function SpectrumView({
         </div>
         <div className="p-3.5">
           <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Peak Position</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-blue-600">
+          <div className="mt-1 text-sm font-mono font-semibold tabular-nums" style={{ color: primaryTrace.color }}>
             {primaryTrace.peak ? `${primaryTrace.peak.x.toFixed(2)} ${primaryTrace.symbol}` : '—'}
           </div>
         </div>
@@ -1188,7 +1160,7 @@ export function SpectrumView({
           <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Peak Intensity</div>
           <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
             {primaryTrace.peak
-              ? overlayEnabled && normalizeOverlay
+              ? isMultiOverlay && normalizeOverlay
                 ? `${primaryTrace.peak.y.toFixed(1)}%`
                 : primaryTrace.peak.y.toLocaleString(undefined, { maximumFractionDigits: 1 })
               : '—'}
@@ -1199,10 +1171,10 @@ export function SpectrumView({
           <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
             {(() => {
               const fmt = (v: number) => {
-                const s = v.toFixed(overlayEnabled && normalizeOverlay ? 1 : 0);
+                const s = v.toFixed(isMultiOverlay && normalizeOverlay ? 1 : 0);
                 return s === '-0' || s === '-0.0' ? s.slice(1) : s;
               };
-              const suffix = overlayEnabled && normalizeOverlay ? '%' : '';
+              const suffix = isMultiOverlay && normalizeOverlay ? '%' : '';
               return `${fmt(primaryTrace.minY)}${suffix} / ${fmt(primaryTrace.meanY)}${suffix}`;
             })()}
           </div>
@@ -1226,7 +1198,7 @@ export function SpectrumView({
 
       {/* Detected Peaks Table + Optional White-Light Image */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <div className={`${whiteLightUrl && !overlayEnabled ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
+        <div className={`${whiteLightUrl && !isMultiOverlay ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
           <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
             <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
               Detected Local Maxima ({combinedPeaks.length})
@@ -1242,7 +1214,7 @@ export function SpectrumView({
                 <thead>
                   <tr className="border-b border-slate-200 text-slate-500 bg-white">
                     <th className="py-2 px-4 font-medium">Rank</th>
-                    {overlayEnabled && <th className="py-2 px-4 font-medium">Sample</th>}
+                    {isMultiOverlay && <th className="py-2 px-4 font-medium">Sample</th>}
                     <th className="py-2 px-4 font-medium">Position ({primaryTrace.symbol || 'X'})</th>
                     <th
                       className="py-2 px-4 font-medium text-right"
@@ -1251,7 +1223,7 @@ export function SpectrumView({
                       FWHM ({primaryTrace.symbol || 'X'})
                     </th>
                     <th className="py-2 px-4 font-medium text-right">
-                      {overlayEnabled && normalizeOverlay
+                      {isMultiOverlay && normalizeOverlay
                         ? 'Intensity (%)'
                         : `Intensity (${wdf.header.spectralUnitsName})`}
                     </th>
@@ -1263,11 +1235,11 @@ export function SpectrumView({
                   {combinedPeaks.map(({ trace, peak: pk }, idx) => (
                     <tr key={`${trace.id}-${pk.index}`} className="hover:bg-slate-50">
                       <td className="py-2 px-4 text-slate-500">#{idx + 1}</td>
-                      {overlayEnabled && (
+                      {isMultiOverlay && (
                         <td className="py-2 px-4 font-sans text-slate-800">
                           <span className="inline-flex items-center gap-1.5">
                             <span
-                              className="w-2 h-2 rounded-xs shrink-0 inline-block"
+                              className="w-2.5 h-2.5 rounded-xs shrink-0 inline-block"
                               style={{ backgroundColor: trace.color }}
                             />
                             <span className="truncate max-w-[190px]">{trace.fileName}</span>
@@ -1275,13 +1247,13 @@ export function SpectrumView({
                         </td>
                       )}
                       <td className="py-2 px-4 font-semibold text-slate-900">{pk.x.toFixed(2)}</td>
-                      <td className="py-2 px-4 text-right font-medium text-blue-600">
+                      <td className="py-2 px-4 text-right font-medium" style={{ color: trace.color }}>
                         {pk.fwhm !== null
                           ? pk.fwhm.toFixed(effectiveUnit === 'electronVolt' ? 5 : 2)
                           : '—'}
                       </td>
                       <td className="py-2 px-4 text-right text-slate-800">
-                        {overlayEnabled && normalizeOverlay
+                        {isMultiOverlay && normalizeOverlay
                           ? `${pk.intensity.toFixed(1)}%`
                           : pk.intensity.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </td>
@@ -1299,7 +1271,7 @@ export function SpectrumView({
           )}
         </div>
 
-        {whiteLightUrl && !overlayEnabled && wdf.whiteLightImage && (
+        {whiteLightUrl && !isMultiOverlay && wdf.whiteLightImage && (
           <div className="bg-white border border-slate-200 rounded overflow-hidden">
             <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
               <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">

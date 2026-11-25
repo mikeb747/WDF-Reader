@@ -1,6 +1,18 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronRight, Download, FileCode2, FileSpreadsheet, FileText, Upload } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  FileCode2,
+  FileSpreadsheet,
+  FolderOpen,
+  Upload,
+} from 'lucide-react';
 import type { WdfFile } from '../lib/wdf';
+import { PWAInstallButton } from './PWAInstallButton';
+import { TRACE_COLOR_PALETTE, TraceColorPicker } from './TraceColorPicker';
+
+export { TRACE_COLOR_PALETTE };
 
 export interface LoadedSample {
   id: string;
@@ -8,13 +20,19 @@ export interface LoadedSample {
   sourceLabel: string;
   bytes: Uint8Array;
   wdf: WdfFile;
+  visible: boolean;
+  color: string;
 }
 
 interface SidebarProps {
   samples: LoadedSample[];
   selectedId: string | null;
   onSelectSample: (id: string) => void;
+  onToggleSampleVisible: (id: string) => void;
+  onSetAllVisible: (visible: boolean) => void;
+  onChangeSampleColor: (id: string, color: string) => void;
   onOpenFileClick: () => void;
+  onOpenFolderClick: () => void;
   onDownloadCsv: () => void;
   onDownloadJson: () => void;
   onDownloadTsModule: () => void;
@@ -36,7 +54,11 @@ export function Sidebar({
   samples,
   selectedId,
   onSelectSample,
+  onToggleSampleVisible,
+  onSetAllVisible,
+  onChangeSampleColor,
   onOpenFileClick,
+  onOpenFolderClick,
   onDownloadCsv,
   onDownloadJson,
   onDownloadTsModule,
@@ -45,6 +67,8 @@ export function Sidebar({
   const [laserExpanded, setLaserExpanded] = useState(false);
   const active = samples.find((s) => s.id === selectedId) ?? null;
   const summary = active?.wdf.summary ?? null;
+  const visibleCount = samples.filter((s) => s.visible).length;
+  const allVisible = samples.length > 0 && visibleCount === samples.length;
 
   const summaryRows: Array<{ label: string; value: string; mono?: boolean }> = summary
     ? [
@@ -122,44 +146,79 @@ export function Sidebar({
     : [];
 
   return (
-    <aside className="w-full lg:w-76 xl:w-80 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col shrink-0 lg:overflow-y-auto">
+    <aside className="w-full lg:w-80 xl:w-84 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col shrink-0 lg:overflow-y-auto">
       {/* Sample Files Selector */}
       <section className="p-4 border-b border-slate-200">
-        <div className="flex items-center justify-between mb-2.5">
-          <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-            Loaded WDF Files
-          </h2>
-          <span className="text-[11px] font-mono tabular-nums text-slate-500">
-            {samples.length} {samples.length === 1 ? 'file' : 'files'}
-          </span>
+        <div className="flex items-center justify-between gap-2 mb-2.5">
+          <div className="flex items-baseline gap-2">
+            <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Loaded WDF Files
+            </h2>
+            <span className="text-[11px] font-mono tabular-nums text-slate-500">
+              {visibleCount}/{samples.length} shown
+            </span>
+          </div>
+
+          {samples.length > 1 && (
+            <button
+              type="button"
+              onClick={() => onSetAllVisible(!allVisible)}
+              className="text-[11px] font-medium text-blue-600 hover:text-blue-700 cursor-pointer whitespace-nowrap"
+            >
+              {allVisible ? 'Isolate Active' : 'Show All'}
+            </button>
+          )}
         </div>
 
-        <div className="space-y-1.5" role="listbox" aria-label="Loaded WDF files">
+        <div
+          className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5"
+          role="listbox"
+          aria-label="Loaded WDF files"
+        >
           {samples.map((sample) => {
             const isSelected = sample.id === selectedId;
             return (
-              <button
+              <div
                 key={sample.id}
-                type="button"
                 role="option"
                 aria-selected={isSelected}
                 onClick={() => onSelectSample(sample.id)}
-                className={`w-full text-left px-3 py-2 rounded border transition-colors cursor-pointer ${
+                className={`w-full text-left px-2.5 py-2 rounded border transition-colors cursor-pointer ${
                   isSelected
                     ? 'bg-blue-50/70 border-blue-600 text-slate-900'
                     : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
                 }`}
               >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium truncate flex items-center gap-1.5">
-                    <FileText
-                      className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-blue-600' : 'text-slate-400'}`}
-                      aria-hidden="true"
+                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                    <input
+                      type="checkbox"
+                      checked={sample.visible}
+                      aria-label={`Plot ${sample.fileName} on spectrum viewer`}
+                      title="Tick to view this file on the spectrum chart"
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={() => onToggleSampleVisible(sample.id)}
+                      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer shrink-0"
                     />
-                    <span className="truncate">{sample.fileName}</span>
-                  </span>
+
+                    <TraceColorPicker
+                      color={sample.color}
+                      fileName={sample.fileName}
+                      onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
+                    />
+
+                    <span
+                      className={`text-xs truncate ${
+                        isSelected ? 'font-semibold text-slate-900' : 'font-medium text-slate-800'
+                      }`}
+                      title={sample.fileName}
+                    >
+                      {sample.fileName}
+                    </span>
+                  </div>
                 </div>
-                <div className="mt-1 flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
+
+                <div className="mt-1 pl-9 flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
                   <span className="truncate">
                     {sample.wdf.summary.xAxisUnits === 'Absolute Wavenumber'
                       ? 'Abs. cm⁻¹'
@@ -169,23 +228,40 @@ export function Sidebar({
                     {sample.wdf.header.pointsPerSpectrum} pts · {formatBytes(sample.wdf.byteLength)}
                   </span>
                 </div>
-              </button>
+              </div>
             );
           })}
         </div>
 
-        <button
-          type="button"
-          onClick={onOpenFileClick}
-          className={`mt-3 w-full px-3 py-2.5 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer ${
-            isDraggingFile
-              ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
-              : 'border-slate-300 bg-slate-50 text-slate-600 hover:border-slate-400 hover:text-slate-900'
-          }`}
-        >
-          <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          <span>{isDraggingFile ? 'Drop .wdf file anywhere' : 'Drop or browse local .wdf file'}</span>
-        </button>
+        {/* File & Directory Loader Controls */}
+        <div className="mt-3 grid grid-cols-2 gap-1.5">
+          <button
+            type="button"
+            onClick={onOpenFileClick}
+            className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
+              isDraggingFile
+                ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
+                : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
+            }`}
+          >
+            <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>Open Files</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenFolderClick}
+            className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
+              isDraggingFile
+                ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
+                : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
+            }`}
+            title="Select a folder and load all Renishaw .wdf files inside it"
+          >
+            <FolderOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>Open Folder</span>
+          </button>
+        </div>
       </section>
 
       {/* Acquisition Summary Table */}
@@ -322,6 +398,8 @@ export function Sidebar({
               <span>JSON</span>
             </button>
           </div>
+
+          <PWAInstallButton />
         </div>
       </section>
     </aside>
