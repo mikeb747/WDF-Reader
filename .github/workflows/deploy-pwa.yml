@@ -27,10 +27,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
 
       - name: Run WDF binary parser unit tests
         run: npx tsx --test src/lib/wdf/parser.test.ts
