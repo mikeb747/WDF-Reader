@@ -1,15 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   ChevronDown,
   ChevronRight,
-  Download,
-  FileCode2,
-  FileSpreadsheet,
+  Folder,
   FolderOpen,
+  GripHorizontal,
+  GripVertical,
   Upload,
 } from 'lucide-react';
+import { stripWdfExtension } from '../lib/format';
 import type { WdfFile } from '../lib/wdf';
-import { PWAInstallButton } from './PWAInstallButton';
 import { TRACE_COLOR_PALETTE, TraceColorPicker } from './TraceColorPicker';
 
 export { TRACE_COLOR_PALETTE };
@@ -17,6 +17,7 @@ export { TRACE_COLOR_PALETTE };
 export interface LoadedSample {
   id: string;
   fileName: string;
+  folderName: string | null;
   sourceLabel: string;
   bytes: Uint8Array;
   wdf: WdfFile;
@@ -29,15 +30,20 @@ interface SidebarProps {
   selectedId: string | null;
   onSelectSample: (id: string) => void;
   onToggleSampleVisible: (id: string) => void;
+  onToggleFolderVisible: (folderName: string) => void;
   onSetAllVisible: (visible: boolean) => void;
   onChangeSampleColor: (id: string, color: string) => void;
   onOpenFileClick: () => void;
   onOpenFolderClick: () => void;
-  onDownloadCsv: () => void;
-  onDownloadJson: () => void;
-  onDownloadTsModule: () => void;
   isDraggingFile: boolean;
 }
+
+const DEFAULT_SIDEBAR_WIDTH = 320;
+const MIN_SIDEBAR_WIDTH = 256;
+const MAX_SIDEBAR_WIDTH = 680;
+/** Default max height accommodates 8 compact file items (~54px each) before scrolling */
+const DEFAULT_MAX_FILES_LIST_HEIGHT = 436;
+const MIN_FILES_LIST_HEIGHT = 96;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -50,25 +56,146 @@ function formatTimestamp(iso: string | null): string {
   return iso.replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 }
 
+interface FolderCheckboxProps {
+  checked: boolean;
+  indeterminate: boolean;
+  folderName: string;
+  onChange: () => void;
+}
+
+function FolderCheckbox({ checked, indeterminate, folderName, onChange }: FolderCheckboxProps) {
+  const ref = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={checked}
+      aria-label={`Show all files in folder ${folderName}`}
+      title={`Tick to show or hide all files in ${folderName}`}
+      onClick={(e) => e.stopPropagation()}
+      onChange={onChange}
+      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer shrink-0"
+    />
+  );
+}
+
 export function Sidebar({
   samples,
   selectedId,
   onSelectSample,
   onToggleSampleVisible,
+  onToggleFolderVisible,
   onSetAllVisible,
   onChangeSampleColor,
   onOpenFileClick,
   onOpenFolderClick,
-  onDownloadCsv,
-  onDownloadJson,
-  onDownloadTsModule,
   isDraggingFile,
 }: SidebarProps) {
+  const [summaryExpanded, setSummaryExpanded] = useState(false);
   const [laserExpanded, setLaserExpanded] = useState(false);
+  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({});
+  const [sidebarWidth, setSidebarWidth] = useState<number>(DEFAULT_SIDEBAR_WIDTH);
+  const [customListHeight, setCustomListHeight] = useState<number | null>(null);
+  const [isResizingWidth, setIsResizingWidth] = useState(false);
+  const [isResizingList, setIsResizingList] = useState(false);
+  const listContainerRef = useRef<HTMLDivElement | null>(null);
+
   const active = samples.find((s) => s.id === selectedId) ?? null;
   const summary = active?.wdf.summary ?? null;
   const visibleCount = samples.filter((s) => s.visible).length;
   const allVisible = samples.length > 0 && visibleCount === samples.length;
+
+  // Separate ungrouped files from folder-grouped files while preserving order
+  const { ungroupedSamples, folderGroups } = useMemo(() => {
+    const ungrouped: LoadedSample[] = [];
+    const map = new Map<string, LoadedSample[]>();
+    for (const sample of samples) {
+      if (!sample.folderName) {
+        ungrouped.push(sample);
+      } else {
+        const list = map.get(sample.folderName);
+        if (list) {
+          list.push(sample);
+        } else {
+          map.set(sample.folderName, [sample]);
+        }
+      }
+    }
+    return {
+      ungroupedSamples: ungrouped,
+      folderGroups: Array.from(map.entries()).map(([folderName, items]) => ({
+        folderName,
+        items,
+      })),
+    };
+  }, [samples]);
+
+  const toggleFolderExpanded = (folderName: string) => {
+    setExpandedFolders((prev) => ({
+      ...prev,
+      [folderName]: !prev[folderName],
+    }));
+  };
+
+  // Drag handle: expand/shrink left panel horizontally
+  const handleStartWidthResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    setIsResizingWidth(true);
+
+    const onMove = (ev: PointerEvent) => {
+      const next = Math.max(
+        MIN_SIDEBAR_WIDTH,
+        Math.min(MAX_SIDEBAR_WIDTH, startWidth + (ev.clientX - startX)),
+      );
+      setSidebarWidth(next);
+    };
+
+    const onUp = () => {
+      setIsResizingWidth(false);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  // Drag handle: expand/shrink "Loaded WDF Files" list vertically
+  const handleStartListResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const currentHeight =
+      customListHeight ?? listContainerRef.current?.getBoundingClientRect().height ?? 200;
+    setIsResizingList(true);
+
+    const onMove = (ev: PointerEvent) => {
+      const maxH = Math.max(260, window.innerHeight - 210);
+      const next = Math.max(MIN_FILES_LIST_HEIGHT, Math.min(maxH, currentHeight + (ev.clientY - startY)));
+      setCustomListHeight(next);
+    };
+
+    const onUp = () => {
+      setIsResizingList(false);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
 
   const summaryRows: Array<{ label: string; value: string; mono?: boolean }> = summary
     ? [
@@ -145,263 +272,371 @@ export function Sidebar({
       ]
     : [];
 
+  const renderSampleRow = (sample: LoadedSample, indented = false) => {
+    const isSelected = sample.id === selectedId;
+    const displayName = stripWdfExtension(sample.fileName);
+    return (
+      <div
+        key={sample.id}
+        role="option"
+        aria-selected={isSelected}
+        onClick={() => onSelectSample(sample.id)}
+        className={`w-full text-left px-2.5 py-1.5 rounded border transition-colors cursor-pointer ${
+          isSelected
+            ? 'bg-blue-50/70 border-blue-600 text-slate-900'
+            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+        } ${indented ? 'text-[11px]' : ''}`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <input
+              type="checkbox"
+              checked={sample.visible}
+              aria-label={`Plot ${displayName} on spectrum viewer`}
+              title="Tick to view this file on the spectrum chart"
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => onToggleSampleVisible(sample.id)}
+              className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer shrink-0"
+            />
+
+            <TraceColorPicker
+              color={sample.color}
+              fileName={displayName}
+              onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
+            />
+
+            <span
+              className={`text-xs truncate ${
+                isSelected ? 'font-semibold text-slate-900' : 'font-medium text-slate-800'
+              }`}
+              title={displayName}
+            >
+              {displayName}
+            </span>
+          </div>
+        </div>
+
+        <div className="mt-0.5 pl-9 flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
+          <span className="truncate">
+            {sample.wdf.summary.xAxisUnits === 'Absolute Wavenumber'
+              ? 'Abs. cm⁻¹'
+              : sample.wdf.summary.xAxisUnits}
+          </span>
+          <span className="whitespace-nowrap shrink-0">
+            {sample.wdf.header.pointsPerSpectrum} pts · {formatBytes(sample.wdf.byteLength)}
+          </span>
+        </div>
+      </div>
+    );
+  };
+
   return (
-    <aside className="w-full lg:w-80 xl:w-84 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col shrink-0 lg:overflow-y-auto">
-      {/* Sample Files Selector */}
-      <section className="p-4 border-b border-slate-200">
-        <div className="flex items-center justify-between gap-2 mb-2.5">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-              Loaded WDF Files
-            </h2>
-            <span className="text-[11px] font-mono tabular-nums text-slate-500">
-              {visibleCount}/{samples.length} shown
-            </span>
-          </div>
+    <div
+      className={`relative flex shrink-0 w-full lg:w-[var(--sidebar-w)] ${
+        isResizingWidth || isResizingList ? 'select-none' : ''
+      }`}
+      style={{ '--sidebar-w': `${sidebarWidth}px` } as CSSProperties}
+    >
+      <aside className="w-full bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col min-w-0 lg:overflow-y-auto">
+        {/* Loaded WDF Files Section */}
+        <section className="pt-4 px-4 pb-0 border-b border-slate-200">
+          <div className="flex items-center justify-between gap-2 mb-2.5">
+            <div className="flex items-baseline gap-2 min-w-0">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 whitespace-nowrap">
+                Loaded WDF Files
+              </h2>
+              <span className="text-[11px] font-mono tabular-nums text-slate-500 whitespace-nowrap">
+                {visibleCount}/{samples.length} shown
+              </span>
+            </div>
 
-          {samples.length > 1 && (
-            <button
-              type="button"
-              onClick={() => onSetAllVisible(!allVisible)}
-              className="text-[11px] font-medium text-blue-600 hover:text-blue-700 cursor-pointer whitespace-nowrap"
-            >
-              {allVisible ? 'Isolate Active' : 'Show All'}
-            </button>
-          )}
-        </div>
-
-        <div
-          className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5"
-          role="listbox"
-          aria-label="Loaded WDF files"
-        >
-          {samples.map((sample) => {
-            const isSelected = sample.id === selectedId;
-            return (
-              <div
-                key={sample.id}
-                role="option"
-                aria-selected={isSelected}
-                onClick={() => onSelectSample(sample.id)}
-                className={`w-full text-left px-2.5 py-2 rounded border transition-colors cursor-pointer ${
-                  isSelected
-                    ? 'bg-blue-50/70 border-blue-600 text-slate-900'
-                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
-                }`}
+            {samples.length > 1 && (
+              <button
+                type="button"
+                onClick={() => onSetAllVisible(!allVisible)}
+                className="text-[11px] font-medium text-blue-600 hover:text-blue-700 cursor-pointer whitespace-nowrap"
               >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 min-w-0 flex-1">
-                    <input
-                      type="checkbox"
-                      checked={sample.visible}
-                      aria-label={`Plot ${sample.fileName} on spectrum viewer`}
-                      title="Tick to view this file on the spectrum chart"
-                      onClick={(e) => e.stopPropagation()}
-                      onChange={() => onToggleSampleVisible(sample.id)}
-                      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer shrink-0"
-                    />
+                {allVisible ? 'Isolate Active' : 'Show All'}
+              </button>
+            )}
+          </div>
 
-                    <TraceColorPicker
-                      color={sample.color}
-                      fileName={sample.fileName}
-                      onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
-                    />
-
-                    <span
-                      className={`text-xs truncate ${
-                        isSelected ? 'font-semibold text-slate-900' : 'font-medium text-slate-800'
-                      }`}
-                      title={sample.fileName}
-                    >
-                      {sample.fileName}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="mt-1 pl-9 flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
-                  <span className="truncate">
-                    {sample.wdf.summary.xAxisUnits === 'Absolute Wavenumber'
-                      ? 'Abs. cm⁻¹'
-                      : sample.wdf.summary.xAxisUnits}
-                  </span>
-                  <span className="whitespace-nowrap shrink-0">
-                    {sample.wdf.header.pointsPerSpectrum} pts · {formatBytes(sample.wdf.byteLength)}
-                  </span>
-                </div>
+          {/* Scrollable File & Folder Tree (auto-grows up to 8 files, or user-dragged height) */}
+          <div
+            ref={listContainerRef}
+            className="space-y-1.5 overflow-y-auto pr-0.5"
+            style={
+              customListHeight !== null
+                ? { height: `${customListHeight}px` }
+                : { maxHeight: `${DEFAULT_MAX_FILES_LIST_HEIGHT}px` }
+            }
+            role="listbox"
+            aria-label="Loaded WDF files"
+          >
+            {samples.length === 0 ? (
+              <div className="py-5 px-3 rounded border border-dashed border-slate-200 bg-slate-50/70 text-center text-xs text-slate-500">
+                No files loaded yet. Open files or a folder below.
               </div>
-            );
-          })}
-        </div>
+            ) : (
+              <>
+                {/* Standalone / Demo Files */}
+                {ungroupedSamples.map((sample) => renderSampleRow(sample))}
 
-        {/* File & Directory Loader Controls */}
-        <div className="mt-3 grid grid-cols-2 gap-1.5">
-          <button
-            type="button"
-            onClick={onOpenFileClick}
-            className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
-              isDraggingFile
-                ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
-                : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
-            }`}
-          >
-            <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span>Open Files</span>
-          </button>
+                {/* Folder-Grouped Files (collapsed by default) */}
+                {folderGroups.map(({ folderName, items }) => {
+                  const isExpanded = Boolean(expandedFolders[folderName]);
+                  const visibleInFolder = items.filter((item) => item.visible).length;
+                  const allInFolderVisible = items.length > 0 && visibleInFolder === items.length;
+                  const someInFolderVisible = visibleInFolder > 0 && !allInFolderVisible;
 
-          <button
-            type="button"
-            onClick={onOpenFolderClick}
-            className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
-              isDraggingFile
-                ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
-                : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
-            }`}
-            title="Select a folder and load all Renishaw .wdf files inside it"
-          >
-            <FolderOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span>Open Folder</span>
-          </button>
-        </div>
-      </section>
-
-      {/* Acquisition Summary Table */}
-      <section className="p-4 border-b border-slate-200 flex-1">
-        <div className="flex items-center justify-between mb-2.5">
-          <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-            Acquisition Summary
-          </h2>
-          {active && (
-            <span className="text-[11px] font-mono tabular-nums text-slate-500">
-              {active.wdf.blocks.length} blocks
-            </span>
-          )}
-        </div>
-
-        {summary ? (
-          <dl className="divide-y divide-slate-100 text-xs">
-            {summaryRows.map((row) => {
-              if (row.label === 'Laser') {
-                const hasLaserMetrics =
-                  summary.laserWavelengthNm !== null || summary.laserWavenumberCm1 !== null;
-                return (
-                  <div key={row.label} className="py-1">
-                    <button
-                      type="button"
-                      onClick={() => setLaserExpanded((prev) => !prev)}
-                      aria-expanded={laserExpanded}
-                      className="w-full py-0.5 flex items-baseline justify-between gap-2 text-left group cursor-pointer rounded hover:bg-slate-50 -mx-1 px-1 transition-colors"
-                      title="Click to show exact laser wavelength (nm) and absolute wavenumber (cm⁻¹)"
+                  return (
+                    <div
+                      key={folderName}
+                      className="rounded border border-slate-200 bg-slate-50/60 overflow-hidden"
                     >
-                      <dt className="text-slate-500 group-hover:text-blue-600 shrink-0 inline-flex items-center gap-1 transition-colors">
-                        {laserExpanded ? (
-                          <ChevronDown className="w-3 h-3 text-blue-600 shrink-0" aria-hidden="true" />
-                        ) : (
-                          <ChevronRight className="w-3 h-3 text-slate-400 group-hover:text-blue-600 shrink-0" aria-hidden="true" />
-                        )}
-                        <span>{row.label}</span>
-                      </dt>
-                      <dd
-                        className="text-blue-600 group-hover:text-blue-700 text-right truncate font-mono tabular-nums text-[11px] font-medium"
-                        title={row.value}
+                      <div
+                        onClick={() => toggleFolderExpanded(folderName)}
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={isExpanded}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            toggleFolderExpanded(folderName);
+                          }
+                        }}
+                        className="px-2 py-2 flex items-center justify-between gap-2 hover:bg-slate-100/80 transition-colors cursor-pointer select-none"
                       >
-                        {row.value}
-                      </dd>
-                    </button>
-                    {laserExpanded && (
-                      <div className="mt-1.5 mb-1 ml-3.5 pl-2.5 pr-2 py-2 rounded border border-slate-200 bg-slate-50 space-y-1 text-[11px]">
-                        {hasLaserMetrics ? (
-                          <>
-                            <div className="flex items-baseline justify-between gap-2">
-                              <span className="text-slate-500">Wavelength</span>
-                              <span className="font-mono tabular-nums font-semibold text-slate-900">
-                                {summary.laserWavelengthNm !== null
-                                  ? `${summary.laserWavelengthNm.toFixed(4)} nm`
-                                  : '—'}
-                              </span>
-                            </div>
-                            <div className="flex items-baseline justify-between gap-2">
-                              <span className="text-slate-500">Absolute cm⁻¹</span>
-                              <span className="font-mono tabular-nums font-semibold text-slate-900">
-                                {summary.laserWavenumberCm1 !== null
-                                  ? `${summary.laserWavenumberCm1.toLocaleString(undefined, {
-                                      minimumFractionDigits: 2,
-                                      maximumFractionDigits: 2,
-                                    })} cm⁻¹`
-                                  : '—'}
-                              </span>
-                            </div>
-                          </>
-                        ) : (
-                          <div className="text-slate-500">Laser calibration value not recorded.</div>
-                        )}
+                        <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                          <span className="text-slate-400 shrink-0">
+                            {isExpanded ? (
+                              <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                            ) : (
+                              <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
+                            )}
+                          </span>
+
+                          <FolderCheckbox
+                            checked={allInFolderVisible}
+                            indeterminate={someInFolderVisible}
+                            folderName={folderName}
+                            onChange={() => onToggleFolderVisible(folderName)}
+                          />
+
+                          {isExpanded ? (
+                            <FolderOpen className="w-3.5 h-3.5 text-blue-600 shrink-0" aria-hidden="true" />
+                          ) : (
+                            <Folder className="w-3.5 h-3.5 text-slate-500 shrink-0" aria-hidden="true" />
+                          )}
+
+                          <span
+                            className="text-xs font-semibold text-slate-800 truncate"
+                            title={folderName}
+                          >
+                            {folderName}
+                          </span>
+                        </div>
+
+                        <span className="text-[11px] font-mono tabular-nums text-slate-500 whitespace-nowrap shrink-0">
+                          {visibleInFolder}/{items.length}
+                        </span>
                       </div>
-                    )}
-                  </div>
-                );
-              }
-              return (
-                <div key={row.label} className="py-1.5 flex items-baseline justify-between gap-3">
-                  <dt className="text-slate-500 shrink-0">{row.label}</dt>
-                  <dd
-                    className={`text-slate-900 text-right truncate ${
-                      row.mono ? 'font-mono tabular-nums text-[11px]' : 'font-medium'
-                    }`}
-                    title={row.value}
-                  >
-                    {row.value}
-                  </dd>
-                </div>
-              );
-            })}
-          </dl>
-        ) : (
-          <p className="text-xs text-slate-500">Select or upload a .wdf file to inspect parameters.</p>
-        )}
-      </section>
 
-      {/* Quick Exports */}
-      <section className="p-4 bg-slate-50/70">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2.5">
-          Export Artifacts
-        </h2>
-        <div className="grid grid-cols-1 gap-1.5">
-          <button
-            type="button"
-            disabled={!active}
-            onClick={onDownloadTsModule}
-            className="w-full px-3 py-1.5 rounded border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 disabled:opacity-40 text-xs font-medium text-slate-800 flex items-center justify-between transition-colors cursor-pointer"
-          >
-            <span className="flex items-center gap-2">
-              <FileCode2 className="w-3.5 h-3.5 text-blue-600" aria-hidden="true" />
-              <span>wdfReader.ts (Digital-Traveller)</span>
-            </span>
-            <Download className="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
-          </button>
+                      {isExpanded && (
+                        <div className="px-2 pb-2 pt-1 space-y-1.5 bg-white border-t border-slate-200/80">
+                          {items.map((sample) => renderSampleRow(sample, true))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
 
-          <div className="grid grid-cols-2 gap-1.5">
+          {/* File & Directory Loader Controls */}
+          <div className="mt-3 mb-2 grid grid-cols-2 gap-1.5">
             <button
               type="button"
-              disabled={!active}
-              onClick={onDownloadCsv}
-              className="px-2.5 py-1.5 rounded border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 disabled:opacity-40 text-xs font-medium text-slate-700 flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+              onClick={onOpenFileClick}
+              className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                isDraggingFile
+                  ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
+                  : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
+              }`}
             >
-              <FileSpreadsheet className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
-              <span>CSV</span>
+              <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Open Files</span>
             </button>
+
             <button
               type="button"
-              disabled={!active}
-              onClick={onDownloadJson}
-              className="px-2.5 py-1.5 rounded border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 disabled:opacity-40 text-xs font-medium text-slate-700 flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+              onClick={onOpenFolderClick}
+              className={`px-2.5 py-2 rounded border border-dashed text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                isDraggingFile
+                  ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
+                  : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
+              }`}
+              title="Select a folder and load all Renishaw .wdf files inside it and its subfolders"
             >
-              <Download className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
-              <span>JSON</span>
+              <FolderOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Open Folder</span>
             </button>
           </div>
 
-          <PWAInstallButton />
+          {/* Vertical Drag Handle to expand Loaded WDF Files down */}
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Drag to resize Loaded WDF Files height"
+            title="Drag down to expand Loaded WDF Files list (double-click to reset)"
+            onPointerDown={handleStartListResize}
+            onDoubleClick={() => setCustomListHeight(null)}
+            className={`-mx-4 h-3.5 flex items-center justify-center cursor-row-resize transition-colors group ${
+              isResizingList ? 'bg-blue-100/80' : 'hover:bg-slate-100/90'
+            }`}
+          >
+            <GripHorizontal
+              className={`w-4 h-3.5 transition-colors ${
+                isResizingList ? 'text-blue-600' : 'text-slate-300 group-hover:text-blue-600'
+              }`}
+              aria-hidden="true"
+            />
+          </div>
+        </section>
+
+        {/* Collapsible Acquisition Summary (Collapsed by default) */}
+        <section className="border-b border-slate-200">
+          <button
+            type="button"
+            onClick={() => setSummaryExpanded((prev) => !prev)}
+            aria-expanded={summaryExpanded}
+            className="w-full px-4 py-3 flex items-center justify-between gap-2 text-left hover:bg-slate-50 transition-colors cursor-pointer"
+          >
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-600">
+              {summaryExpanded ? (
+                <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" aria-hidden="true" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
+              )}
+              <span>Acquisition Summary</span>
+            </span>
+            {active && (
+              <span className="text-[11px] font-mono tabular-nums text-slate-500">
+                {active.wdf.blocks.length} blocks
+              </span>
+            )}
+          </button>
+
+          {summaryExpanded && (
+            <div className="px-4 pb-4">
+              {summary ? (
+                <dl className="divide-y divide-slate-100 text-xs">
+                  {summaryRows.map((row) => {
+                    if (row.label === 'Laser') {
+                      const hasLaserMetrics =
+                        summary.laserWavelengthNm !== null || summary.laserWavenumberCm1 !== null;
+                      return (
+                        <div key={row.label} className="py-1">
+                          <button
+                            type="button"
+                            onClick={() => setLaserExpanded((prev) => !prev)}
+                            aria-expanded={laserExpanded}
+                            className="w-full py-0.5 flex items-baseline justify-between gap-2 text-left group cursor-pointer rounded hover:bg-slate-50 -mx-1 px-1 transition-colors"
+                            title="Click to show exact laser wavelength (nm) and absolute wavenumber (cm⁻¹)"
+                          >
+                            <dt className="text-slate-500 group-hover:text-blue-600 shrink-0 inline-flex items-center gap-1 transition-colors">
+                              {laserExpanded ? (
+                                <ChevronDown className="w-3 h-3 text-blue-600 shrink-0" aria-hidden="true" />
+                              ) : (
+                                <ChevronRight className="w-3 h-3 text-slate-400 group-hover:text-blue-600 shrink-0" aria-hidden="true" />
+                              )}
+                              <span>{row.label}</span>
+                            </dt>
+                            <dd
+                              className="text-blue-600 group-hover:text-blue-700 text-right truncate font-mono tabular-nums text-[11px] font-medium"
+                              title={row.value}
+                            >
+                              {row.value}
+                            </dd>
+                          </button>
+                          {laserExpanded && (
+                            <div className="mt-1.5 mb-1 ml-3.5 pl-2.5 pr-2 py-2 rounded border border-slate-200 bg-slate-50 space-y-1 text-[11px]">
+                              {hasLaserMetrics ? (
+                                <>
+                                  <div className="flex items-baseline justify-between gap-2">
+                                    <span className="text-slate-500">Wavelength</span>
+                                    <span className="font-mono tabular-nums font-semibold text-slate-900">
+                                      {summary.laserWavelengthNm !== null
+                                        ? `${summary.laserWavelengthNm.toFixed(4)} nm`
+                                        : '—'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-baseline justify-between gap-2">
+                                    <span className="text-slate-500">Absolute cm⁻¹</span>
+                                    <span className="font-mono tabular-nums font-semibold text-slate-900">
+                                      {summary.laserWavenumberCm1 !== null
+                                        ? `${summary.laserWavenumberCm1.toLocaleString(undefined, {
+                                            minimumFractionDigits: 2,
+                                            maximumFractionDigits: 2,
+                                          })} cm⁻¹`
+                                        : '—'}
+                                    </span>
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="text-slate-500">Laser calibration value not recorded.</div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+                    return (
+                      <div key={row.label} className="py-1.5 flex items-baseline justify-between gap-3">
+                        <dt className="text-slate-500 shrink-0">{row.label}</dt>
+                        <dd
+                          className={`text-slate-900 text-right truncate ${
+                            row.mono ? 'font-mono tabular-nums text-[11px]' : 'font-medium'
+                          }`}
+                          title={row.value}
+                        >
+                          {row.value}
+                        </dd>
+                      </div>
+                    );
+                  })}
+                </dl>
+              ) : (
+                <p className="text-xs text-slate-500">Select or open a file to inspect parameters.</p>
+              )}
+            </div>
+          )}
+        </section>
+      </aside>
+
+      {/* Right-Edge Horizontal Drag Handle to expand left panel right (Desktop) */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Drag to resize left panel width"
+        title="Drag right to expand the left panel (double-click to reset)"
+        onPointerDown={handleStartWidthResize}
+        onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+        className={`hidden lg:flex absolute top-0 bottom-0 -right-1.5 w-3 z-20 cursor-col-resize items-center justify-center group ${
+          isResizingWidth ? 'bg-blue-500/15' : 'hover:bg-blue-500/10'
+        }`}
+      >
+        <div
+          className={`w-3.5 h-10 rounded flex items-center justify-center transition-colors ${
+            isResizingWidth
+              ? 'bg-blue-600 text-white shadow-xs'
+              : 'bg-white border border-slate-200 text-slate-400 group-hover:border-blue-500 group-hover:text-blue-600 shadow-2xs'
+          }`}
+        >
+          <GripVertical className="w-3 h-3" aria-hidden="true" />
         </div>
-      </section>
-    </aside>
+      </div>
+    </div>
   );
 }

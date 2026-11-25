@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import { Check, Copy, Download, FileCode2, Workflow } from 'lucide-react';
-import type { WdfFile } from '../lib/wdf';
 import {
   buildStandaloneWdfReaderTs,
   DIGITAL_TRAVELLER_BROWSER_SNIPPET,
@@ -21,13 +20,10 @@ import psetRaw from '../lib/wdf/pset.ts?raw';
 import typesRaw from '../lib/wdf/types.ts?raw';
 
 interface TypeScriptExportViewProps {
-  wdf: WdfFile;
-  fileName: string;
   onDownloadTsModule: () => void;
-  onDownloadJson: () => void;
 }
 
-type CodeTab = 'usage' | 'module' | 'github-pwa' | 'json';
+type CodeTab = 'usage' | 'module' | 'github-pwa';
 
 interface ProjectSourceFile {
   path: string;
@@ -123,55 +119,8 @@ function downloadTextFile(content: string, fileName: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export function serializeWdfForJson(wdf: WdfFile): string {
-  const payload = {
-    byteLength: wdf.byteLength,
-    header: wdf.header,
-    summary: wdf.summary,
-    xAxis: wdf.xAxis
-      ? {
-          dataTypeName: wdf.xAxis.dataTypeName,
-          unitsName: wdf.xAxis.unitsName,
-          unitsSymbol: wdf.xAxis.unitsSymbol,
-          length: wdf.xAxis.values.length,
-          first5: Array.from(wdf.xAxis.values.slice(0, 5)),
-          last5: Array.from(wdf.xAxis.values.slice(-5)),
-        }
-      : null,
-    spectraSummary: {
-      totalPoints: wdf.spectra.length,
-      spectraCollected: wdf.header.spectraCollected,
-      pointsPerSpectrum: wdf.header.pointsPerSpectrum,
-      first10Intensities: Array.from(wdf.spectra.slice(0, 10)),
-    },
-    origins: wdf.origins,
-    mapArea: wdf.mapArea,
-    comment: wdf.comment,
-    blocks: wdf.blocks,
-    propertySets: wdf.propertySets,
-    warnings: wdf.warnings,
-  };
-
-  return JSON.stringify(
-    payload,
-    (_key, val) => {
-      if (val instanceof Uint8Array) {
-        return `<Uint8Array(${val.byteLength} bytes)>`;
-      }
-      if (val instanceof Float32Array) {
-        return Array.from(val);
-      }
-      return val;
-    },
-    2,
-  );
-}
-
 export function TypeScriptExportView({
-  wdf,
-  fileName,
   onDownloadTsModule,
-  onDownloadJson,
 }: TypeScriptExportViewProps) {
   const [activeCodeTab, setActiveCodeTab] = useState<CodeTab>('usage');
   const [runtimeMode, setRuntimeMode] = useState<'node' | 'browser'>('node');
@@ -179,7 +128,6 @@ export function TypeScriptExportView({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const standaloneModule = useMemo(() => buildStandaloneWdfReaderTs(), []);
-  const liveJson = useMemo(() => serializeWdfForJson(wdf), [wdf]);
   const moduleLines = useMemo(() => standaloneModule.split('\n').length, [standaloneModule]);
 
   const activeSourceFile =
@@ -209,11 +157,9 @@ export function TypeScriptExportView({
       ? standaloneModule
       : activeCodeTab === 'github-pwa'
         ? activeSourceFile.content
-        : activeCodeTab === 'json'
-          ? liveJson
-          : runtimeMode === 'node'
-            ? DIGITAL_TRAVELLER_NODE_SNIPPET
-            : DIGITAL_TRAVELLER_BROWSER_SNIPPET;
+        : runtimeMode === 'node'
+          ? DIGITAL_TRAVELLER_NODE_SNIPPET
+          : DIGITAL_TRAVELLER_BROWSER_SNIPPET;
 
   return (
     <div className="p-5 lg:p-6 space-y-5 max-w-[1400px]">
@@ -273,8 +219,8 @@ export function TypeScriptExportView({
           <p className="mt-1 text-slate-500">Converts between Raman Shift, Abs. cm⁻¹, Wavelength nm, and Energy eV.</p>
         </div>
         <div className="p-3.5">
-          <div className="font-mono font-semibold text-slate-900">subtractBaseline / detectPeaks / wdfToCsv</div>
-          <p className="mt-1 text-slate-500">AsLS fluorescence baseline removal, FWHM peak detection, and RFC-4180 CSV export.</p>
+          <div className="font-mono font-semibold text-slate-900">subtractBaseline / detectPeaks</div>
+          <p className="mt-1 text-slate-500">AsLS fluorescence baseline removal and FWHM local peak detection.</p>
         </div>
       </div>
 
@@ -287,7 +233,6 @@ export function TypeScriptExportView({
                 { id: 'usage', label: 'Digital-Traveller Usage' },
                 { id: 'module', label: 'Full wdfReader.ts Module' },
                 { id: 'github-pwa', label: 'GitHub Actions PWA & src/ Files' },
-                { id: 'json', label: 'Live Parsed JSON' },
               ] as Array<{ id: CodeTab; label: string }>
             ).map((tab) => (
               <button
@@ -340,22 +285,6 @@ export function TypeScriptExportView({
                 <Download className="w-3 h-3" aria-hidden="true" />
                 <span>Download {activeSourceFile.downloadName}</span>
               </button>
-            )}
-
-            {activeCodeTab === 'json' && (
-              <>
-                <span className="hidden sm:inline text-[11px] font-mono text-slate-500">
-                  {fileName}
-                </span>
-                <button
-                  type="button"
-                  onClick={onDownloadJson}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 cursor-pointer"
-                >
-                  <Download className="w-3 h-3" aria-hidden="true" />
-                  <span>Save JSON</span>
-                </button>
-              </>
             )}
 
             <button

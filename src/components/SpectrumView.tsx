@@ -9,6 +9,7 @@ import {
   type WdfFile,
   type WdfPeak,
 } from '../lib/wdf';
+import { stripWdfExtension } from '../lib/format';
 import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
@@ -182,10 +183,13 @@ function buildTrace(
 
   const peaks = detectPeaks(xs, ys, 5, 16);
 
+  const cleanName = stripWdfExtension(fileName);
+  const cleanTitle = stripWdfExtension(wdf.header.title || cleanName);
+
   return {
     id: sampleId,
-    fileName,
-    title: wdf.header.title || fileName,
+    fileName: cleanName,
+    title: cleanTitle,
     color,
     points,
     label: converted.label,
@@ -243,10 +247,8 @@ export function SpectrumView({
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   const visibleSamples = useMemo(() => {
-    const ticked = samples.filter((s) => s.visible);
-    if (ticked.length > 0) return ticked;
-    return samples.filter((s) => s.id === activeSampleId);
-  }, [samples, activeSampleId]);
+    return samples.filter((s) => s.visible);
+  }, [samples]);
 
   const isMultiOverlay = visibleSamples.length > 1;
   const allVisible = samples.length > 1 && visibleSamples.length === samples.length;
@@ -498,6 +500,30 @@ export function SpectrumView({
     return rows;
   }, [traces]);
 
+  if (visibleSamples.length === 0) {
+    return (
+      <div className="p-6 max-w-[1400px]">
+        <div className="bg-white border border-slate-200 rounded p-8 text-center space-y-3">
+          <h1 className="text-base font-semibold text-slate-900">
+            No spectra selected for plotting
+          </h1>
+          <p className="text-xs text-slate-500 max-w-md mx-auto">
+            Tick a folder or individual file in <strong>Loaded WDF Files</strong> on the left to plot one or more spectra.
+          </p>
+          {samples.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onSetAllVisible(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium cursor-pointer transition-colors"
+            >
+              Show All ({samples.length})
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   if (!primaryTrace) {
     return (
       <div className="p-6 text-sm text-slate-600">
@@ -505,6 +531,8 @@ export function SpectrumView({
       </div>
     );
   }
+
+  const displayFileName = stripWdfExtension(fileName);
 
   const yAxisTitle =
     isMultiOverlay && normalizeOverlay
@@ -521,7 +549,7 @@ export function SpectrumView({
           <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">
             {isMultiOverlay
               ? `Overlay Comparison (${traces.length} spectra)`
-              : primaryTrace.title || fileName}
+              : primaryTrace.title || displayFileName}
           </h1>
           <p className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
             {isMultiOverlay ? (
@@ -672,33 +700,36 @@ export function SpectrumView({
               <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                 Overlaid Spectra
               </span>
-              {samples.map((sample) => (
-                <div
-                  key={sample.id}
-                  className="inline-flex items-center gap-1.5 text-xs text-slate-800 select-none"
-                >
-                  <input
-                    type="checkbox"
-                    checked={sample.visible}
-                    aria-label={`Overlay ${sample.fileName}`}
-                    onChange={() => onToggleSampleVisible(sample.id)}
-                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
-                  />
-                  <TraceColorPicker
-                    color={sample.color}
-                    fileName={sample.fileName}
-                    size="sm"
-                    onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
-                  />
-                  <span
-                    onClick={() => onToggleSampleVisible(sample.id)}
-                    className="font-mono text-[11px] truncate max-w-[230px] cursor-pointer"
-                    title={sample.fileName}
+              {visibleSamples.map((sample) => {
+                const cleanSampleName = stripWdfExtension(sample.fileName);
+                return (
+                  <div
+                    key={sample.id}
+                    className="inline-flex items-center gap-1.5 text-xs text-slate-800 select-none"
                   >
-                    {sample.fileName}
-                  </span>
-                </div>
-              ))}
+                    <input
+                      type="checkbox"
+                      checked={sample.visible}
+                      aria-label={`Overlay ${cleanSampleName}`}
+                      onChange={() => onToggleSampleVisible(sample.id)}
+                      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                    />
+                    <TraceColorPicker
+                      color={sample.color}
+                      fileName={cleanSampleName}
+                      size="sm"
+                      onChange={(newColor) => onChangeSampleColor(sample.id, newColor)}
+                    />
+                    <span
+                      onClick={() => onToggleSampleVisible(sample.id)}
+                      className="font-mono text-[11px] truncate max-w-[230px] cursor-pointer"
+                      title={cleanSampleName}
+                    >
+                      {cleanSampleName}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
 
             <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer select-none whitespace-nowrap">
@@ -810,7 +841,7 @@ export function SpectrumView({
             aria-label={
               isMultiOverlay
                 ? `Overlaid Raman spectra plot comparing ${traces.length} files`
-                : `Raman spectrum plot of ${primaryTrace.title || fileName}`
+                : `Raman spectrum plot of ${primaryTrace.title || displayFileName}`
             }
             onPointerMove={handlePointerMove}
             onPointerDown={handlePointerDown}

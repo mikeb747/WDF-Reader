@@ -44,7 +44,11 @@ jobs:
           # Automatically sets Vite base path to /<repo-name>/ for GitHub Pages project sites,
           # or / if deploying to a <username>.github.io root repository.
           GITHUB_PAGES_BASE: ${{ endsWith(github.repository, '.github.io') && '/' || format('/{0}/', github.event.repository.name) }}
-        run: npm run build
+          # Production PWA build excludes AI Studio demo .wdf files and hides Block Map & TypeScript Export tabs
+          VITE_PWA_BUILD: 'true'
+        run: |
+          npm run build
+          rm -rf dist/assets/aistudio
 
       - name: Add SPA 404 fallback for GitHub Pages
         run: cp dist/index.html dist/404.html

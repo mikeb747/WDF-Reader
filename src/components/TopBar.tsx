@@ -1,21 +1,25 @@
-import { Upload } from 'lucide-react';
+import { PWAInstallButton } from './PWAInstallButton';
 
 export type ActiveTab = 'spectrum' | 'instrument' | 'blocks' | 'export';
 
 interface TopBarProps {
   activeTab: ActiveTab;
   onSelectTab: (tab: ActiveTab) => void;
-  onOpenFileClick: () => void;
+  isPwaBuild?: boolean;
 }
 
-const NAV_ITEMS: Array<{ id: ActiveTab; label: string }> = [
+const ALL_NAV_ITEMS: Array<{ id: ActiveTab; label: string; demoOnly?: boolean }> = [
   { id: 'spectrum', label: 'Spectrum' },
   { id: 'instrument', label: 'Instrument' },
-  { id: 'blocks', label: 'Block Map' },
-  { id: 'export', label: 'TypeScript Export' },
+  { id: 'blocks', label: 'Block Map', demoOnly: true },
+  { id: 'export', label: 'TypeScript Export', demoOnly: true },
 ];
 
-export function TopBar({ activeTab, onSelectTab, onOpenFileClick }: TopBarProps) {
+export function TopBar({ activeTab, onSelectTab, isPwaBuild = false }: TopBarProps) {
+  const navItems = isPwaBuild
+    ? ALL_NAV_ITEMS.filter((item) => !item.demoOnly)
+    : ALL_NAV_ITEMS;
+
   return (
     <header className="bg-white border-b border-slate-200 shrink-0">
       <div className="h-14 px-4 lg:px-6 flex items-center justify-between gap-4">
@@ -31,7 +35,7 @@ export function TopBar({ activeTab, onSelectTab, onOpenFileClick }: TopBarProps)
 
         {/* Zone 2: Navigation Tabs (Desktop) */}
         <nav aria-label="Primary sections" className="hidden md:flex items-center h-full gap-2">
-          {NAV_ITEMS.map((item) => {
+          {navItems.map((item) => {
             const isActive = activeTab === item.id;
             return (
               <button
@@ -51,15 +55,10 @@ export function TopBar({ activeTab, onSelectTab, onOpenFileClick }: TopBarProps)
           })}
         </nav>
 
-        {/* Zone 3: Single Primary Action */}
-        <button
-          type="button"
-          onClick={onOpenFileClick}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-        >
-          <Upload className="w-3.5 h-3.5" aria-hidden="true" />
-          <span>Open .wdf File</span>
-        </button>
+        {/* Zone 3: Install Desktop PWA Action */}
+        <div className="flex items-center justify-end shrink-0 min-w-[2rem]">
+          <PWAInstallButton />
+        </div>
       </div>
 
       {/* Mobile Navigation Row */}
@@ -67,7 +66,7 @@ export function TopBar({ activeTab, onSelectTab, onOpenFileClick }: TopBarProps)
         aria-label="Mobile sections"
         className="flex md:hidden items-center border-t border-slate-100 px-3 gap-1 overflow-x-auto"
       >
-        {NAV_ITEMS.map((item) => {
+        {navItems.map((item) => {
           const isActive = activeTab === item.id;
           return (
             <button

@@ -23,14 +23,11 @@ export function PWAInstallButton() {
       <button
         type="button"
         onClick={() => void handleClick()}
-        className="w-full px-3 py-1.5 rounded border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 text-xs font-medium text-slate-800 flex items-center justify-between transition-colors cursor-pointer"
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 hover:border-slate-400 text-slate-800 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
         title="Install WDF Reader as an offline-ready desktop or mobile Progressive Web App"
       >
-        <span className="flex items-center gap-2">
-          <MonitorDown className="w-3.5 h-3.5 text-blue-600" aria-hidden="true" />
-          <span>{isIOS ? 'Install PWA on iOS' : 'Install Desktop / Mobile PWA'}</span>
-        </span>
-        <span className="text-[10px] font-mono text-slate-500">PWA</span>
+        <MonitorDown className="w-3.5 h-3.5 text-blue-600 shrink-0" aria-hidden="true" />
+        <span>{isIOS ? 'Install App' : 'Install Desktop'}</span>
       </button>
 
       {showGuide && (

@@ -7,6 +7,7 @@ import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   const base = process.env.GITHUB_PAGES_BASE || '/';
+  const isPwaProdBuild = process.env.VITE_PWA_BUILD === 'true';
 
   return {
     base,
@@ -24,10 +25,10 @@ export default defineConfig(() => {
         ],
         manifest: {
           id: base,
-          name: 'WDF Reader — Renishaw Raman Parser for Digital-Traveller',
+          name: 'WDF Reader — Renishaw Raman Parser',
           short_name: 'WDF Reader',
           description:
-            'Complete zero-dependency TypeScript parser and offline-capable inspector for Renishaw WiRE (.wdf) Raman spectroscopy files.',
+            'Zero-dependency offline-capable viewer and analyzer for Renishaw WiRE (.wdf) Raman spectroscopy files.',
           theme_color: '#0F172A',
           background_color: '#F8FAFC',
           display: 'standalone',
@@ -55,7 +56,10 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,txt,wdf}'],
+          globPatterns: isPwaProdBuild
+            ? ['**/*.{js,css,html,ico,png,svg,woff,woff2}']
+            : ['**/*.{js,css,html,ico,png,svg,woff,woff2,txt,wdf}'],
+          globIgnores: isPwaProdBuild ? ['**/assets/aistudio/**'] : [],
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           runtimeCaching: [
             {
@@ -93,6 +97,20 @@ export default defineConfig(() => {
           type: 'module',
         },
       }),
+      // Strip bundled AI Studio demo files from dist/ during production GitHub PWA builds
+      {
+        name: 'exclude-demo-assets-in-pwa-build',
+        apply: 'build',
+        closeBundle(error?: Error): void {
+          if (error || !isPwaProdBuild) {
+            return;
+          }
+          const demoAssetsDir = path.resolve(__dirname, 'dist/assets/aistudio');
+          if (fs.existsSync(demoAssetsDir)) {
+            fs.rmSync(demoAssetsDir, {recursive: true, force: true});
+          }
+        },
+      },
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.

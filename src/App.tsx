@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, X } from 'lucide-react';
+import { AlertCircle, FolderOpen, Upload, X } from 'lucide-react';
 import { BlockMapView } from './components/BlockMapView';
 import { InstrumentView } from './components/InstrumentView';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import { Sidebar, TRACE_COLOR_PALETTE, type LoadedSample } from './components/Sidebar';
 import { SpectrumView, type BaselineStrength } from './components/SpectrumView';
 import { TopBar, type ActiveTab } from './components/TopBar';
-import { serializeWdfForJson, TypeScriptExportView } from './components/TypeScriptExportView';
-import { parseWdf, wdfToCsv, type SpectralTargetUnit } from './lib/wdf';
+import { TypeScriptExportView } from './components/TypeScriptExportView';
+import { stripWdfExtension } from './lib/format';
+import { parseWdf, type SpectralTargetUnit } from './lib/wdf';
 import { buildStandaloneWdfReaderTs } from './lib/wdf/exportModule';
 
 const BASE_URL = import.meta.env.BASE_URL || '/';
+const IS_PWA_BUILD = import.meta.env.VITE_PWA_BUILD === 'true';
 
 const BUNDLED_SAMPLES: Array<{ id: string; fileName: string; url: string }> = [
   {
@@ -25,6 +27,11 @@ const BUNDLED_SAMPLES: Array<{ id: string; fileName: string; url: string }> = [
   },
 ];
 
+interface IncomingFile {
+  file: File;
+  folderName: string | null;
+}
+
 function triggerDownload(content: string, fileName: string, mimeType: string) {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -37,16 +44,30 @@ function triggerDownload(content: string, fileName: string, mimeType: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function extractFolderFromPath(relPath: string | undefined | null): string | null {
+  if (!relPath) return null;
+  const normalized = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const lastSlash = normalized.lastIndexOf('/');
+  if (lastSlash <= 0) return null;
+  return normalized.slice(0, lastSlash);
+}
+
 /**
- * Recursively collect File objects from DataTransferItemList when a directory is dropped.
+ * Recursively collect File objects and their relative subfolder paths when a directory is dropped.
  */
 async function extractFilesFromDataTransfer(dataTransfer: DataTransfer): Promise<{
-  files: File[];
+  files: IncomingFile[];
   fromDirectory: boolean;
 }> {
   const items = dataTransfer.items;
   if (!items || items.length === 0) {
-    return { files: Array.from(dataTransfer.files), fromDirectory: false };
+    return {
+      files: Array.from(dataTransfer.files).map((file) => ({
+        file,
+        folderName: extractFolderFromPath(file.webkitRelativePath),
+      })),
+      fromDirectory: false,
+    };
   }
 
   const entries: FileSystemEntry[] = [];
@@ -61,12 +82,18 @@ async function extractFilesFromDataTransfer(dataTransfer: DataTransfer): Promise
   }
 
   if (entries.length === 0 || !hasDirectory) {
-    return { files: Array.from(dataTransfer.files), fromDirectory: false };
+    return {
+      files: Array.from(dataTransfer.files).map((file) => ({
+        file,
+        folderName: extractFolderFromPath(file.webkitRelativePath),
+      })),
+      fromDirectory: false,
+    };
   }
 
-  const collected: File[] = [];
+  const collected: IncomingFile[] = [];
 
-  async function walkEntry(entry: FileSystemEntry): Promise<void> {
+  async function walkEntry(entry: FileSystemEntry, parentFolder: string | null): Promise<void> {
     if (entry.isFile) {
       const fileEntry = entry as FileSystemFileEntry;
       const file = await new Promise<File | null>((resolve) => {
@@ -75,8 +102,15 @@ async function extractFilesFromDataTransfer(dataTransfer: DataTransfer): Promise
           () => resolve(null),
         );
       });
-      if (file) collected.push(file);
+      if (file) {
+        const fromFullPath = extractFolderFromPath(entry.fullPath);
+        collected.push({
+          file,
+          folderName: fromFullPath ?? parentFolder,
+        });
+      }
     } else if (entry.isDirectory) {
+      const nextFolder = parentFolder ? `${parentFolder}/${entry.name}` : entry.name;
       const dirReader = (entry as FileSystemDirectoryEntry).createReader();
       const readAllEntries = async (): Promise<FileSystemEntry[]> => {
         const all: FileSystemEntry[] = [];
@@ -94,13 +128,13 @@ async function extractFilesFromDataTransfer(dataTransfer: DataTransfer): Promise
       };
       const children = await readAllEntries();
       for (const child of children) {
-        await walkEntry(child);
+        await walkEntry(child, nextFolder);
       }
     }
   }
 
   for (const entry of entries) {
-    await walkEntry(entry);
+    await walkEntry(entry, null);
   }
   return { files: collected, fromDirectory: true };
 }
@@ -123,7 +157,7 @@ export default function App() {
   const [baselineEnabled, setBaselineEnabled] = useState(false);
   const [baselineStrength, setBaselineStrength] = useState<BaselineStrength>('standard');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isLoadingSamples, setIsLoadingSamples] = useState(true);
+  const [isLoadingSamples, setIsLoadingSamples] = useState(!IS_PWA_BUILD);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -135,8 +169,13 @@ export default function App() {
     return color;
   }, []);
 
-  // Load both bundled Renishaw sample files on startup
+  // Load both bundled Renishaw demo files only in AI Studio demo mode (excluded in GitHub PWA builds)
   useEffect(() => {
+    if (IS_PWA_BUILD) {
+      setIsLoadingSamples(false);
+      return;
+    }
+
     let cancelled = false;
     async function loadBundled() {
       const loaded: LoadedSample[] = [];
@@ -151,7 +190,8 @@ export default function App() {
           loaded.push({
             id: spec.id,
             fileName: spec.fileName,
-            sourceLabel: 'Bundled sample',
+            folderName: null,
+            sourceLabel: 'Demo sample',
             bytes,
             wdf,
             visible: i === 0,
@@ -177,16 +217,20 @@ export default function App() {
   }, []);
 
   const ingestFiles = useCallback(
-    async (files: File[], isDirectoryBatch = false) => {
-      if (files.length === 0) return;
+    async (incoming: IncomingFile[], isDirectoryBatch = false) => {
+      if (incoming.length === 0) return;
       setErrorMessage(null);
       const newlyLoaded: LoadedSample[] = [];
       const errors: string[] = [];
 
-      // Sort directory files alphabetically for predictable ordering
-      const orderedFiles = [...files].sort((a, b) => a.name.localeCompare(b.name));
+      // Sort by folder path, then file name for predictable folder grouping
+      const ordered = [...incoming].sort((a, b) => {
+        const folderCmp = (a.folderName ?? '').localeCompare(b.folderName ?? '');
+        if (folderCmp !== 0) return folderCmp;
+        return a.file.name.localeCompare(b.file.name);
+      });
 
-      for (const file of orderedFiles) {
+      for (const { file, folderName } of ordered) {
         if (file.name.startsWith('.')) continue;
         try {
           const buf = await file.arrayBuffer();
@@ -195,39 +239,51 @@ export default function App() {
           // In directory mode, quietly skip non-WDF auxiliary files (images, hidden OS files, etc.)
           if (isDirectoryBatch && !hasWdf1Magic(bytes)) {
             if (file.name.toLowerCase().endsWith('.wdf')) {
-              errors.push(`${file.name}: Invalid WDF1 header signature`);
+              errors.push(`${stripWdfExtension(file.name)}: Invalid WDF1 header signature`);
             }
             continue;
           }
 
           const wdf = parseWdf(bytes);
+          const resolvedFolder = isDirectoryBatch
+            ? folderName || 'Imported Folder'
+            : null;
+
           newlyLoaded.push({
             id: `upload-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             fileName: file.name,
+            folderName: resolvedFolder,
             sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded',
             bytes,
             wdf,
-            visible: true,
+            // Folder-loaded files start unchecked inside collapsed folders; user ticks the folder or files to view
+            visible: !isDirectoryBatch,
             color: allocateColor(),
           });
         } catch (err) {
-          errors.push(`${file.name}: ${err instanceof Error ? err.message : 'Unable to parse file'}`);
+          errors.push(
+            `${stripWdfExtension(file.name)}: ${err instanceof Error ? err.message : 'Unable to parse file'}`,
+          );
         }
       }
 
       if (newlyLoaded.length > 0) {
         setSamples((prev) => {
-          // If only 1 file was previously visible and user uploaded a single file, show the newly uploaded file;
-          // if user loaded multiple files / a folder, tick all newly loaded files so they appear on the chart.
-          if (newlyLoaded.length === 1 && prev.filter((s) => s.visible).length <= 1) {
+          if (!isDirectoryBatch && newlyLoaded.length === 1 && prev.filter((s) => s.visible).length <= 1) {
             return [
               ...newlyLoaded,
               ...prev.map((s) => ({ ...s, visible: false })),
             ];
           }
+          if (isDirectoryBatch) {
+            return [...prev, ...newlyLoaded];
+          }
           return [...newlyLoaded, ...prev];
         });
-        setSelectedId(newlyLoaded[0].id);
+        setSelectedId((prevSelected) => prevSelected ?? newlyLoaded[0].id);
+        if (!isDirectoryBatch) {
+          setSelectedId(newlyLoaded[0].id);
+        }
       } else if (isDirectoryBatch && errors.length === 0) {
         setErrorMessage('No valid Renishaw .wdf files (WDF1 signature) were found in the selected folder.');
       }
@@ -239,33 +295,44 @@ export default function App() {
     [allocateColor],
   );
 
-  const activeSample = samples.find((s) => s.id === selectedId) ?? null;
+  const activeSample = samples.find((s) => s.id === selectedId) ?? samples[0] ?? null;
 
   const handleSelectSample = (id: string) => {
     setSelectedId(id);
     setSamples((prev) => {
       const visibleList = prev.filter((s) => s.visible);
-      // If we are in single-trace view, clicking another file switches the plotted trace to the clicked file.
       if (visibleList.length <= 1) {
         return prev.map((s) => ({ ...s, visible: s.id === id }));
       }
-      // If multiple files are already ticked, keep them ticked and ensure the clicked file is also visible.
       return prev.map((s) => (s.id === id ? { ...s, visible: true } : s));
     });
     setErrorMessage(null);
   };
 
   const handleToggleSampleVisible = (id: string) => {
+    setSamples((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, visible: !s.visible } : s)),
+    );
+  };
+
+  const handleToggleFolderVisible = (folderName: string) => {
+    let firstInFolderId: string | null = null;
+    let turningOn = false;
+
     setSamples((prev) => {
-      const target = prev.find((s) => s.id === id);
-      if (!target) return prev;
-      const visibleCount = prev.filter((s) => s.visible).length;
-      // Keep at least 1 spectrum visible on the chart
-      if (target.visible && visibleCount <= 1) {
-        return prev;
-      }
-      return prev.map((s) => (s.id === id ? { ...s, visible: !s.visible } : s));
+      const folderItems = prev.filter((s) => s.folderName === folderName);
+      if (folderItems.length === 0) return prev;
+      firstInFolderId = folderItems[0].id;
+      const allVisible = folderItems.every((s) => s.visible);
+      turningOn = !allVisible;
+      return prev.map((s) =>
+        s.folderName === folderName ? { ...s, visible: turningOn } : s,
+      );
     });
+
+    if (turningOn && firstInFolderId) {
+      setSelectedId(firstInFolderId);
+    }
   };
 
   const handleSetAllVisible = (visible: boolean) => {
@@ -282,28 +349,16 @@ export default function App() {
     setSamples((prev) => prev.map((s) => (s.id === id ? { ...s, color } : s)));
   };
 
-  const handleDownloadCsv = () => {
-    if (!activeSample) return;
-    const base = activeSample.fileName.replace(/\.[^.]+$/, '');
-    const csv = wdfToCsv(activeSample.wdf, {
-      spectrumIndex: 0,
-      sortAscending: true,
-      targetUnit,
-    });
-    triggerDownload(csv, `${base}.csv`, 'text/csv;charset=utf-8');
-  };
-
-  const handleDownloadJson = () => {
-    if (!activeSample) return;
-    const base = activeSample.fileName.replace(/\.[^.]+$/, '');
-    const json = serializeWdfForJson(activeSample.wdf);
-    triggerDownload(json, `${base}.json`, 'application/json;charset=utf-8');
-  };
-
   const handleDownloadTsModule = () => {
     const code = buildStandaloneWdfReaderTs();
     triggerDownload(code, 'wdfReader.ts', 'text/typescript;charset=utf-8');
   };
+
+  // Ensure PWA build can never display hidden demo-only tabs
+  const effectiveTab: ActiveTab =
+    IS_PWA_BUILD && (activeTab === 'blocks' || activeTab === 'export')
+      ? 'spectrum'
+      : activeTab;
 
   return (
     <div
@@ -333,13 +388,15 @@ export default function App() {
         className="hidden"
         aria-label="Upload Renishaw WDF file"
         onChange={(e) => {
-          const files = e.target.files ? Array.from(e.target.files) : [];
+          const files = e.target.files
+            ? Array.from(e.target.files).map((file) => ({ file, folderName: null }))
+            : [];
           void ingestFiles(files, false);
           e.target.value = '';
         }}
       />
 
-      {/* Directory Picker (loads all .wdf files in the chosen folder) */}
+      {/* Directory Picker (loads all .wdf files in the chosen folder & subfolders) */}
       <input
         ref={folderInputRef}
         type="file"
@@ -350,16 +407,21 @@ export default function App() {
         className="hidden"
         aria-label="Upload Renishaw WDF folder"
         onChange={(e) => {
-          const files = e.target.files ? Array.from(e.target.files) : [];
+          const files = e.target.files
+            ? Array.from(e.target.files).map((file) => ({
+                file,
+                folderName: extractFolderFromPath(file.webkitRelativePath),
+              }))
+            : [];
           void ingestFiles(files, true);
           e.target.value = '';
         }}
       />
 
       <TopBar
-        activeTab={activeTab}
+        activeTab={effectiveTab}
         onSelectTab={setActiveTab}
-        onOpenFileClick={() => fileInputRef.current?.click()}
+        isPwaBuild={IS_PWA_BUILD}
       />
 
       {errorMessage && (
@@ -385,29 +447,54 @@ export default function App() {
       <div className="flex-1 flex flex-col lg:flex-row min-h-0">
         <Sidebar
           samples={samples}
-          selectedId={selectedId}
+          selectedId={activeSample?.id ?? null}
           onSelectSample={handleSelectSample}
           onToggleSampleVisible={handleToggleSampleVisible}
+          onToggleFolderVisible={handleToggleFolderVisible}
           onSetAllVisible={handleSetAllVisible}
           onChangeSampleColor={handleChangeSampleColor}
           onOpenFileClick={() => fileInputRef.current?.click()}
           onOpenFolderClick={() => folderInputRef.current?.click()}
-          onDownloadCsv={handleDownloadCsv}
-          onDownloadJson={handleDownloadJson}
-          onDownloadTsModule={handleDownloadTsModule}
           isDraggingFile={isDraggingFile}
         />
 
         <main className="flex-1 min-w-0 lg:overflow-y-auto bg-slate-50">
           {isLoadingSamples ? (
             <div className="p-8 text-sm text-slate-500 font-mono">
-              Loading bundled Renishaw .wdf spectra…
+              Loading bundled Renishaw demo spectra…
             </div>
           ) : !activeSample ? (
-            <div className="p-8 text-sm text-slate-600">
-              Open or drop a Renishaw <span className="font-mono">.wdf</span> file or folder to inspect its spectral data, PSET instrument metadata, and block map.
+            <div className="p-8 max-w-xl mx-auto mt-8">
+              <div className="bg-white border border-slate-200 rounded p-8 text-center space-y-4">
+                <div className="space-y-1.5">
+                  <h1 className="text-base font-semibold text-slate-900">
+                    Open Renishaw Raman Spectra
+                  </h1>
+                  <p className="text-xs text-slate-500">
+                    Load individual <span className="font-mono">.wdf</span> files, open a folder with subfolders, or drag and drop files anywhere onto this window.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium cursor-pointer transition-colors"
+                  >
+                    <Upload className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Open Files</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-medium cursor-pointer transition-colors"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5 text-slate-600" aria-hidden="true" />
+                    <span>Open Folder</span>
+                  </button>
+                </div>
+              </div>
             </div>
-          ) : activeTab === 'spectrum' ? (
+          ) : effectiveTab === 'spectrum' ? (
             <SpectrumView
               samples={samples}
               activeSampleId={activeSample.id}
@@ -423,17 +510,12 @@ export default function App() {
               onSetAllVisible={handleSetAllVisible}
               onChangeSampleColor={handleChangeSampleColor}
             />
-          ) : activeTab === 'instrument' ? (
+          ) : effectiveTab === 'instrument' ? (
             <InstrumentView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
-          ) : activeTab === 'blocks' ? (
+          ) : effectiveTab === 'blocks' ? (
             <BlockMapView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
           ) : (
-            <TypeScriptExportView
-              wdf={activeSample.wdf}
-              fileName={activeSample.fileName}
-              onDownloadTsModule={handleDownloadTsModule}
-              onDownloadJson={handleDownloadJson}
-            />
+            <TypeScriptExportView onDownloadTsModule={handleDownloadTsModule} />
           )}
         </main>
       </div>
