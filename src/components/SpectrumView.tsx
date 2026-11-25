@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Layers, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { Layers, Maximize2, Minimize2, RotateCcw, SlidersHorizontal } from 'lucide-react';
 import {
+  autoSubtractBaseline,
   convertXAxis,
   detectPeaks,
   getSpectrum,
   subtractBaseline,
+  type AutoBaselineResult,
   type SpectralTargetUnit,
   type WdfFile,
   type WdfPeak,
@@ -13,9 +15,9 @@ import { stripWdfExtension } from '../lib/format';
 import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
-export type BaselineStrength = 'gentle' | 'standard' | 'aggressive';
+export type BaselineStrength = 'auto' | 'gentle' | 'standard' | 'aggressive';
 
-const BASELINE_LAMBDA: Record<BaselineStrength, number> = {
+const MANUAL_BASELINE_LAMBDA: Record<Exclude<BaselineStrength, 'auto'>, number> = {
   gentle: 1e6,
   standard: 1e5,
   aggressive: 1e4,
@@ -35,6 +37,8 @@ interface SpectrumViewProps {
   onToggleSampleVisible: (id: string) => void;
   onSetAllVisible: (visible: boolean) => void;
   onChangeSampleColor: (id: string, color: string) => void;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
 }
 
 const UNIT_OPTIONS: Array<{ id: SpectralTargetUnit; label: string }> = [
@@ -92,6 +96,8 @@ interface ComputedTrace {
   meanY: number;
   peak: { x: number; y: number; origIdx: number } | null;
   peaks: WdfPeak[];
+  autoBaselineProfile?: AutoBaselineResult['profile'];
+  autoBaselineLambda?: number;
 }
 
 function buildTrace(
@@ -103,7 +109,7 @@ function buildTrace(
   targetUnit: SpectralTargetUnit,
   sortAscending: boolean,
   baselineEnabled: boolean,
-  baselineLambda: number,
+  baselineStrength: BaselineStrength,
   normalize: boolean,
 ): ComputedTrace | null {
   if (!wdf.xAxis) return null;
@@ -126,10 +132,22 @@ function buildTrace(
 
   let baselineArr: Float64Array;
   let workingY: Float64Array;
+  let autoBaselineProfile: AutoBaselineResult['profile'] | undefined;
+  let autoBaselineLambda: number | undefined;
+
   if (baselineEnabled) {
-    const res = subtractBaseline(orderedRawY, { lambda: baselineLambda, p: 0.005, iterations: 10 });
-    baselineArr = res.baseline;
-    workingY = res.corrected;
+    if (baselineStrength === 'auto') {
+      const res = autoSubtractBaseline(orderedRawY);
+      baselineArr = res.baseline;
+      workingY = res.corrected;
+      autoBaselineProfile = res.profile;
+      autoBaselineLambda = res.lambda;
+    } else {
+      const lambda = MANUAL_BASELINE_LAMBDA[baselineStrength];
+      const res = subtractBaseline(orderedRawY, { lambda, p: 0.005, iterations: 10 });
+      baselineArr = res.baseline;
+      workingY = res.corrected;
+    }
   } else {
     baselineArr = new Float64Array(order.length);
     workingY = orderedRawY;
@@ -201,6 +219,8 @@ function buildTrace(
     meanY: points.length > 0 ? sumY / points.length : 0,
     peak: points[peakIdx] ? { x: points[peakIdx].x, y: points[peakIdx].y, origIdx: points[peakIdx].origIdx } : null,
     peaks,
+    autoBaselineProfile,
+    autoBaselineLambda,
   };
 }
 
@@ -221,6 +241,21 @@ function findNearestPoint(
   return best;
 }
 
+function computeMedian(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+function formatCompactArea(area: number): string {
+  const abs = Math.abs(area);
+  if (abs >= 1e6 || (abs > 0 && abs < 1e-2)) {
+    return area.toExponential(2);
+  }
+  return area.toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+
 export function SpectrumView({
   samples,
   activeSampleId,
@@ -235,6 +270,8 @@ export function SpectrumView({
   onToggleSampleVisible,
   onSetAllVisible,
   onChangeSampleColor,
+  isFullscreen = false,
+  onToggleFullscreen,
 }: SpectrumViewProps) {
   const [spectrumIndex, setSpectrumIndex] = useState(0);
   const [showPeaks, setShowPeaks] = useState(true);
@@ -286,7 +323,6 @@ export function SpectrumView({
   }, [isMultiOverlay, targetUnit, visibleSamples]);
 
   const traces = useMemo<ComputedTrace[]>(() => {
-    const lambda = BASELINE_LAMBDA[baselineStrength];
     const list: ComputedTrace[] = [];
     for (const sample of visibleSamples) {
       const trace = buildTrace(
@@ -298,7 +334,7 @@ export function SpectrumView({
         effectiveUnit,
         sortAscending,
         baselineEnabled,
-        lambda,
+        baselineStrength,
         isMultiOverlay && normalizeOverlay,
       );
       if (trace) list.push(trace);
@@ -414,9 +450,17 @@ export function SpectrumView({
   const xStep = xTicks.length >= 2 ? Math.abs(xTicks[1] - xTicks[0]) : 1;
   const yStep = yTicks.length >= 2 ? Math.abs(yTicks[1] - yTicks[0]) : 1;
 
-  const getSvgCoords = (clientX: number): number | null => {
+  const getSvgCoords = (clientX: number, clientY: number): number | null => {
     const svg = svgRef.current;
     if (!svg) return null;
+    const ctm = svg.getScreenCTM();
+    if (ctm) {
+      const pt = svg.createSVGPoint();
+      pt.x = clientX;
+      pt.y = clientY;
+      const transformed = pt.matrixTransform(ctm.inverse());
+      if (Number.isFinite(transformed.x)) return transformed.x;
+    }
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0) return null;
     return ((clientX - rect.left) / rect.width) * CHART_WIDTH;
@@ -424,7 +468,7 @@ export function SpectrumView({
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (traces.length === 0) return;
-    const svgX = getSvgCoords(e.clientX);
+    const svgX = getSvgCoords(e.clientX, e.clientY);
     if (svgX === null) return;
 
     const clampedX = Math.max(MARGIN.left, Math.min(MARGIN.left + PLOT_W, svgX));
@@ -436,7 +480,7 @@ export function SpectrumView({
   };
 
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
-    const svgX = getSvgCoords(e.clientX);
+    const svgX = getSvgCoords(e.clientX, e.clientY);
     if (svgX === null) return;
     if (svgX < MARGIN.left || svgX > MARGIN.left + PLOT_W) return;
     setDragSelection({ startX: svgX, currentX: svgX });
@@ -500,6 +544,117 @@ export function SpectrumView({
     return rows;
   }, [traces]);
 
+  // Quantitative Statistics for the active spectrum over the current view domain
+  const activeStats = useMemo(() => {
+    if (!primaryTrace) return null;
+    const primarySample = samples.find((s) => s.id === primaryTrace.id) ?? null;
+    const activeWdf = primarySample?.wdf ?? wdf;
+
+    const inView = primaryTrace.points.filter(
+      (p) => p.x >= viewDomain.xMin && p.x <= viewDomain.xMax,
+    );
+    const pts = inView.length >= 3 ? inView : primaryTrace.points;
+    if (pts.length === 0) return null;
+
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let sumY = 0;
+    let peakPt = pts[0];
+
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) {
+        maxY = p.y;
+        peakPt = p;
+      }
+      sumY += p.y;
+    }
+
+    const meanY = sumY / pts.length;
+    const yValues = pts.map((p) => p.y);
+    const sortedY = [...yValues].sort((a, b) => a - b);
+    const medianY = computeMedian(sortedY);
+
+    // Lower quartile median approximates the baseline floor away from Raman bands
+    const lowerQuartileCount = Math.max(1, Math.floor(sortedY.length * 0.25));
+    const baselineFloor = baselineEnabled
+      ? 0
+      : computeMedian(sortedY.slice(0, lowerQuartileCount));
+
+    // Robust high-frequency noise sigma via 2nd-order finite difference MAD:
+    // d2[i] = (y[i+1] - 2*y[i] + y[i-1]) / sqrt(6) cancels constant & linear baseline drift
+    const sqrt6 = Math.sqrt(6);
+    const d2: number[] = [];
+    for (let i = 1; i < pts.length - 1; i++) {
+      d2.push((pts[i + 1].y - 2 * pts[i].y + pts[i - 1].y) / sqrt6);
+    }
+    let noiseSigma: number | null = null;
+    if (d2.length >= 3) {
+      const medD2 = computeMedian(d2);
+      const absDev = d2.map((v) => Math.abs(v - medD2));
+      const mad = computeMedian(absDev);
+      const sigma = 1.4826 * mad;
+      if (sigma > 0) {
+        noiseSigma = sigma;
+      }
+    }
+    if (noiseSigma === null && lowerQuartileCount >= 2) {
+      const lowSlice = sortedY.slice(0, lowerQuartileCount);
+      const lowMean = lowSlice.reduce((a, b) => a + b, 0) / lowSlice.length;
+      const variance =
+        lowSlice.reduce((acc, v) => acc + (v - lowMean) * (v - lowMean), 0) /
+        Math.max(1, lowSlice.length - 1);
+      const sd = Math.sqrt(variance);
+      if (sd > 0) noiseSigma = sd;
+    }
+
+    const signalAmplitude = Math.max(0, maxY - baselineFloor);
+    const snr = noiseSigma && noiseSigma > 0 ? signalAmplitude / noiseSigma : null;
+    const snrDb = snr !== null && snr > 0 ? 20 * Math.log10(snr) : null;
+
+    // Max intensity wavelength in nanometres (computed via convertXAxis regardless of displayed unit)
+    let peakWavelengthNm: number | null = null;
+    if (activeWdf.xAxis && peakPt.origIdx >= 0 && peakPt.origIdx < activeWdf.xAxis.values.length) {
+      const nmAxis = convertXAxis(activeWdf.xAxis, activeWdf.header.laserWavenumber, 'nanometre');
+      const val = nmAxis.values[peakPt.origIdx];
+      if (Number.isFinite(val) && val > 0) {
+        peakWavelengthNm = val;
+      }
+    }
+
+    // Trapezoidal integrated area above baseline floor
+    let integratedArea = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const dx = Math.abs(pts[i].x - pts[i - 1].x);
+      const avgHeight = 0.5 * (pts[i - 1].y + pts[i].y) - baselineFloor;
+      integratedArea += avgHeight * dx;
+    }
+
+    // Dominant peak FWHM from detected local maxima
+    const matchedPeak =
+      primaryTrace.peaks.find((pk) => Math.abs(pk.x - peakPt.x) < 1e-3) ??
+      primaryTrace.peaks[0] ??
+      null;
+
+    return {
+      pointCount: pts.length,
+      peakX: peakPt.x,
+      peakY: maxY,
+      peakWavelengthNm,
+      minY,
+      meanY,
+      medianY,
+      baselineFloor,
+      dynamicRange: maxY - minY,
+      noiseSigma,
+      snr,
+      snrDb,
+      integratedArea,
+      dominantFwhm: matchedPeak?.fwhm ?? null,
+    };
+  }, [primaryTrace, samples, wdf, viewDomain.xMin, viewDomain.xMax, baselineEnabled]);
+
   if (visibleSamples.length === 0) {
     return (
       <div className="p-6 max-w-[1400px]">
@@ -508,7 +663,7 @@ export function SpectrumView({
             No spectra selected for plotting
           </h1>
           <p className="text-xs text-slate-500 max-w-md mx-auto">
-            Tick a folder or individual file in <strong>Loaded WDF Files</strong> on the left to plot one or more spectra.
+            Tick a folder or individual file in <strong>Explorer</strong> on the left to plot one or more spectra.
           </p>
           {samples.length > 0 && (
             <button
@@ -542,34 +697,42 @@ export function SpectrumView({
         : `Intensity (${wdf.header.spectralUnitsName})`;
 
   return (
-    <div className="p-5 lg:p-6 space-y-5 max-w-[1400px]">
+    <div
+      className={
+        isFullscreen
+          ? 'h-full flex flex-col p-3 lg:p-4 space-y-3 max-w-none'
+          : 'p-5 lg:p-6 space-y-5 max-w-[1400px]'
+      }
+    >
       {/* Header & Controls Bar */}
-      <div className="space-y-3 border-b border-slate-200 pb-4">
-        <div className="min-w-0">
-          <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">
-            {isMultiOverlay
-              ? `Overlay Comparison (${traces.length} spectra)`
-              : primaryTrace.title || displayFileName}
-          </h1>
-          <p className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-            {isMultiOverlay ? (
-              <>
-                Comparing {traces.map((t) => t.fileName).join(' · ')} · Axis: {primaryTrace.label}
-                {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
-              </>
-            ) : (
-              <>
-                {primaryTrace.fileName} · {primaryTrace.points.length.toLocaleString()} points ·{' '}
-                {wdf.summary.laserWavenumberCm1
-                  ? `Laser ${wdf.summary.laserWavenumberCm1.toFixed(2)} cm⁻¹ (${wdf.summary.laserWavelengthNm?.toFixed(2)} nm)`
-                  : 'Laser wavenumber not specified'}
-                {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
-              </>
-            )}
-          </p>
-        </div>
+      <div className={`space-y-3 border-b border-slate-200 ${isFullscreen ? 'pb-3 shrink-0' : 'pb-4'}`}>
+        {!isFullscreen && (
+          <div className="min-w-0">
+            <h1 className="text-lg font-semibold text-slate-900 tracking-tight truncate">
+              {isMultiOverlay
+                ? `Overlay Comparison (${traces.length} spectra)`
+                : primaryTrace.title || displayFileName}
+            </h1>
+            <p className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
+              {isMultiOverlay ? (
+                <>
+                  Comparing {traces.map((t) => t.fileName).join(' · ')} · Axis: {primaryTrace.label}
+                  {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
+                </>
+              ) : (
+                <>
+                  {primaryTrace.fileName} · {primaryTrace.points.length.toLocaleString()} points ·{' '}
+                  {wdf.summary.laserWavenumberCm1
+                    ? `Laser ${wdf.summary.laserWavenumberCm1.toFixed(2)} cm⁻¹ (${wdf.summary.laserWavelengthNm?.toFixed(2)} nm)`
+                    : 'Laser wavenumber not specified'}
+                  {baselineEnabled ? ` · AsLS Baseline (${baselineStrength})` : ''}
+                </>
+              )}
+            </p>
+          </div>
+        )}
 
-        {/* Unit Selector, Baseline Correction, Overlay Mode & Plot Toggles */}
+        {/* Unit Selector, Baseline Correction, Overlay Mode, Plot Toggles & Fullscreen */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <div
@@ -597,7 +760,7 @@ export function SpectrumView({
               })}
             </div>
 
-            {/* Baseline Correction Toggle + Smoothness */}
+            {/* Auto-Baseline Toggle + Adaptive / Manual Mode */}
             <button
               type="button"
               onClick={onToggleBaseline}
@@ -607,19 +770,24 @@ export function SpectrumView({
                   ? 'bg-blue-600 border-blue-600 text-white'
                   : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
               }`}
-              title="Apply Asymmetric Least Squares (AsLS) baseline correction to remove fluorescence and background drift"
+              title="Automatically detect spectral background & fluorescence and adjust the baseline to reveal subtle Raman features"
             >
               <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Baseline Correction</span>
+              <span>Auto-Baseline</span>
             </button>
 
             {baselineEnabled && (
               <select
-                aria-label="Baseline smoothness"
+                aria-label="Baseline mode"
                 value={baselineStrength}
                 onChange={(e) => onChangeBaselineStrength(e.target.value as BaselineStrength)}
                 className="px-2 py-1.5 rounded border border-slate-200 bg-white text-xs text-slate-700 focus:outline-none focus:border-blue-600 cursor-pointer"
               >
+                <option value="auto">
+                  {primaryTrace.autoBaselineProfile
+                    ? `Auto (${primaryTrace.autoBaselineProfile})`
+                    : 'Auto (Detected)'}
+                </option>
                 <option value="gentle">Gentle (λ=10⁶)</option>
                 <option value="standard">Standard (λ=10⁵)</option>
                 <option value="aggressive">Aggressive (λ=10⁴)</option>
@@ -644,7 +812,7 @@ export function SpectrumView({
             </button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-4">
+          <div className="flex flex-wrap items-center gap-3">
             {baselineEnabled && !isMultiOverlay && (
               <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap">
                 <input
@@ -687,12 +855,42 @@ export function SpectrumView({
                 <span>Reset Zoom</span>
               </button>
             )}
+
+            {onToggleFullscreen && (
+              <button
+                type="button"
+                onClick={onToggleFullscreen}
+                aria-pressed={isFullscreen}
+                title={isFullscreen ? 'Exit Fullscreen (Esc)' : 'Expand chart to cover the entire application area'}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                  isFullscreen
+                    ? 'bg-slate-900 border-slate-900 text-white hover:bg-slate-800'
+                    : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50 hover:border-slate-400'
+                }`}
+              >
+                {isFullscreen ? (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Exit Fullscreen</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Fullscreen</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>
 
       {/* Main Spectrum Plot Card */}
-      <div className="bg-white border border-slate-200 rounded">
+      <div
+        className={`bg-white border border-slate-200 rounded ${
+          isFullscreen ? 'flex-1 flex flex-col min-h-0' : ''
+        }`}
+      >
         {/* Overlay Sample Selector Strip */}
         {isMultiOverlay && (
           <div className="px-4 py-2.5 bg-slate-50/90 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
@@ -832,11 +1030,22 @@ export function SpectrumView({
         </div>
 
         {/* SVG Raman Plot */}
-        <div className="p-2 sm:p-3">
+        <div
+          className={
+            isFullscreen
+              ? 'flex-1 min-h-0 p-2 sm:p-3 flex items-center justify-center'
+              : 'p-2 sm:p-3'
+          }
+        >
           <svg
             ref={svgRef}
             viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-            className="w-full h-auto select-none cursor-crosshair block"
+            preserveAspectRatio="xMidYMid meet"
+            className={
+              isFullscreen
+                ? 'w-full h-full select-none cursor-crosshair block'
+                : 'w-full h-auto select-none cursor-crosshair block'
+            }
             role="img"
             aria-label={
               isMultiOverlay
@@ -1167,68 +1376,148 @@ export function SpectrumView({
         </div>
       )}
 
-      {/* Quantitative Metrics Strip */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 border border-slate-200 rounded bg-white divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Data Points</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
-            {primaryTrace.points.length.toLocaleString()}
-          </div>
-        </div>
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">X Range</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
-            {viewDomain.xMin.toFixed(1)} – {viewDomain.xMax.toFixed(1)}
-          </div>
-        </div>
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Peak Position</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums" style={{ color: primaryTrace.color }}>
-            {primaryTrace.peak ? `${primaryTrace.peak.x.toFixed(2)} ${primaryTrace.symbol}` : '—'}
-          </div>
-        </div>
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Peak Intensity</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
-            {primaryTrace.peak
-              ? isMultiOverlay && normalizeOverlay
-                ? `${primaryTrace.peak.y.toFixed(1)}%`
-                : primaryTrace.peak.y.toLocaleString(undefined, { maximumFractionDigits: 1 })
-              : '—'}
-          </div>
-        </div>
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">Min / Mean</div>
-          <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
-            {(() => {
-              const fmt = (v: number) => {
-                const s = v.toFixed(isMultiOverlay && normalizeOverlay ? 1 : 0);
-                return s === '-0' || s === '-0.0' ? s.slice(1) : s;
-              };
-              const suffix = isMultiOverlay && normalizeOverlay ? '%' : '';
-              return `${fmt(primaryTrace.minY)}${suffix} / ${fmt(primaryTrace.meanY)}${suffix}`;
-            })()}
-          </div>
-        </div>
-        <div className="p-3.5">
-          <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
-            {baselineEnabled ? 'Baseline' : 'Native Axis'}
-          </div>
-          <div
-            className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900 whitespace-nowrap"
-            title={baselineEnabled ? `AsLS (${baselineStrength})` : wdf.summary.xAxisUnits}
-          >
-            {baselineEnabled
-              ? `AsLS · ${baselineStrength}`
-              : wdf.summary.xAxisUnits === 'Absolute Wavenumber'
-                ? 'Abs. cm⁻¹'
-                : wdf.summary.xAxisUnits}
-          </div>
-        </div>
-      </div>
+      {/* Statistics Panel & Detected Peaks (hidden during Fullscreen chart mode) */}
+      {!isFullscreen && (
+        <>
+          {activeStats && (
+            <section
+              aria-label="Statistics"
+              className="bg-white border border-slate-200 rounded overflow-hidden"
+            >
+              <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
+                    Statistics
+                  </h2>
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-mono text-slate-600 truncate">
+                    <span
+                      className="w-2 h-2 rounded-xs shrink-0 inline-block"
+                      style={{ backgroundColor: primaryTrace.color }}
+                    />
+                    <span className="truncate">{primaryTrace.fileName}</span>
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono tabular-nums text-slate-500">
+                  {zoomRange ? 'Zoomed range' : 'Full range'} · {activeStats.pointCount.toLocaleString()} pts
+                  {baselineEnabled ? ` · AsLS (${baselineStrength})` : ''}
+                </span>
+              </div>
 
-      {/* Detected Peaks Table + Optional White-Light Image */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+              <div className="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border-b border-slate-200">
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Peak Position
+                  </div>
+                  <div
+                    className="mt-1 text-sm font-mono font-semibold tabular-nums"
+                    style={{ color: primaryTrace.color }}
+                  >
+                    {activeStats.peakX.toFixed(2)} {primaryTrace.symbol}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
+                    Active axis ({primaryTrace.label})
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Peak Wavelength
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {activeStats.peakWavelengthNm !== null
+                      ? `${activeStats.peakWavelengthNm.toFixed(2)} nm`
+                      : '—'}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
+                    Max intensity wavelength
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Signal-to-Noise (Est.)
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {activeStats.snr !== null
+                      ? `${activeStats.snr >= 100 ? Math.round(activeStats.snr).toLocaleString() : activeStats.snr.toFixed(1)} : 1`
+                      : '—'}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
+                    {activeStats.snrDb !== null && activeStats.noiseSigma !== null
+                      ? `${activeStats.snrDb.toFixed(1)} dB · σ = ${activeStats.noiseSigma.toFixed(1)}`
+                      : '2nd-diff MAD estimate'}
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Peak Intensity
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {isMultiOverlay && normalizeOverlay
+                      ? `${activeStats.peakY.toFixed(1)}%`
+                      : activeStats.peakY.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
+                    Range:{' '}
+                    {isMultiOverlay && normalizeOverlay
+                      ? `${activeStats.dynamicRange.toFixed(1)}%`
+                      : activeStats.dynamicRange.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Dominant FWHM
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {activeStats.dominantFwhm !== null
+                      ? `${activeStats.dominantFwhm.toFixed(effectiveUnit === 'electronVolt' ? 5 : 2)} ${primaryTrace.symbol}`
+                      : '—'}
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Baseline / Mean
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {(() => {
+                      const fmt = (v: number) => {
+                        const s = v.toFixed(isMultiOverlay && normalizeOverlay ? 1 : 1);
+                        return s === '-0.0' ? '0.0' : s;
+                      };
+                      const suffix = isMultiOverlay && normalizeOverlay ? '%' : '';
+                      return `${fmt(activeStats.baselineFloor)}${suffix} / ${fmt(activeStats.meanY)}${suffix}`;
+                    })()}
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    Integrated Area
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {formatCompactArea(activeStats.integratedArea)}
+                  </div>
+                </div>
+
+                <div className="p-3.5">
+                  <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                    X Range
+                  </div>
+                  <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
+                    {viewDomain.xMin.toFixed(1)} – {viewDomain.xMax.toFixed(1)}
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* Detected Peaks Table + Optional White-Light Image */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className={`${whiteLightUrl && !isMultiOverlay ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
           <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
             <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
@@ -1319,7 +1608,9 @@ export function SpectrumView({
             </div>
           </div>
         )}
-      </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

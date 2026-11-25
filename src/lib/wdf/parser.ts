@@ -17,6 +17,7 @@ import {
   WdfMapAreaFlag,
   WdfMeasurementType,
   WdfScanType,
+  type AutoBaselineResult,
   type BaselineOptions,
   type BaselineResult,
   type PsetObject,
@@ -295,14 +296,43 @@ function asObject(val: unknown): PsetObject | null {
 function asNumber(val: unknown): number | null {
   if (typeof val === 'number' && Number.isFinite(val)) return Object.is(val, -0) ? 0 : val;
   if (typeof val === 'string' && val.trim() !== '') {
-    const n = Number(val);
-    return Number.isFinite(n) ? (Object.is(n, -0) ? 0 : n) : null;
+    const trimmed = val.trim();
+    const direct = Number(trimmed);
+    if (Number.isFinite(direct)) return Object.is(direct, -0) ? 0 : direct;
+    const match = trimmed.match(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?/);
+    if (match) {
+      const parsed = Number(match[0]);
+      if (Number.isFinite(parsed)) return Object.is(parsed, -0) ? 0 : parsed;
+    }
   }
   return null;
 }
 
 function asString(val: unknown): string | null {
   return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null;
+}
+
+/**
+ * Recursively find a numeric property by case-insensitive key name in a PSET object.
+ */
+function findNumericProperty(obj: PsetObject | null, targetKeyLower: string): number | null {
+  if (!obj) return null;
+  // Prefer direct match on current object first
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.trim().toLowerCase() === targetKeyLower) {
+      const n = asNumber(v);
+      if (n !== null) return n;
+    }
+  }
+  // Fall back to searching nested PSET sub-objects
+  for (const v of Object.values(obj)) {
+    const child = asObject(v);
+    if (child) {
+      const found = findNumericProperty(child, targetKeyLower);
+      if (found !== null) return found;
+    }
+  }
+  return null;
 }
 
 function buildInstrumentSummary(
@@ -379,10 +409,19 @@ function buildInstrumentSummary(
     ? { name: xAxis.unitsName, symbol: xAxis.unitsSymbol }
     : { name: 'Unknown', symbol: '' };
 
+  const instrumentType = asString(wxis?.['Instrument type']);
+  const ndTransmissionPercent = asNumber(wxis?.['ND Transmission %']);
+  const isVirsa = instrumentType !== null && instrumentType.toLowerCase().includes('virsa');
+  const laserPowerMw = isVirsa ? findNumericProperty(wxis, 'laser power mw') : null;
+  const effectiveLaserPowerMw =
+    isVirsa && laserPowerMw !== null && ndTransmissionPercent !== null
+      ? Math.round(laserPowerMw * (ndTransmissionPercent / 100) * 100) / 100
+      : null;
+
   return {
     title: header.title,
     operator: header.operator,
-    instrumentType: asString(wxis?.['Instrument type']),
+    instrumentType,
     application: `${header.applicationName} ${header.applicationVersion}`.trim(),
     measurementType: header.measurementTypeName,
     scanType: header.scanTypeName,
@@ -399,7 +438,9 @@ function buildInstrumentSummary(
     grating: asString(sysConfig?.['Grating']),
     objective: asString(microscope?.['ObjectiveName']),
     objectiveMagnification: asNumber(microscope?.['ObjectiveMagnification']),
-    ndTransmissionPercent: asNumber(wxis?.['ND Transmission %']),
+    ndTransmissionPercent,
+    laserPowerMw,
+    effectiveLaserPowerMw,
     exposureTimeMs: asNumber(scanConfig?.['Exposure Time']),
     accumulations: asNumber(scanConfig?.['Accumulations']) ?? header.accumulations,
     slitOpening: asString(slits?.['Opening']),
@@ -984,4 +1025,95 @@ export function subtractBaseline(
   }
 
   return { baseline, corrected };
+}
+
+/**
+ * Fully automatic Raman baseline correction that analyzes the spectrum's lower-envelope
+ * fluorescence curvature and high-frequency noise level, then adaptively tunes AsLS (λ, p)
+ * to flatten background drift and reveal subtle Raman peaks without manual tweaking.
+ */
+export function autoSubtractBaseline(yValues: ArrayLike<number>): AutoBaselineResult {
+  const n = yValues.length;
+  if (n < 16) {
+    const res = subtractBaseline(yValues, { lambda: 1e5, p: 0.005, iterations: 10 });
+    return { ...res, lambda: 1e5, p: 0.005, profile: 'Flat' };
+  }
+
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const v = yValues[i];
+    if (v < minY) minY = v;
+    if (v > maxY) maxY = v;
+  }
+  const totalSpan = Math.max(maxY - minY, 1e-6);
+
+  // Sample coarse lower envelope across 12 segments using 15th percentile to ignore sharp peaks
+  const segCount = Math.min(12, Math.max(6, Math.floor(n / 40)));
+  const segSize = Math.floor(n / segCount);
+  const env: number[] = [];
+  for (let s = 0; s < segCount; s++) {
+    const start = s * segSize;
+    const end = s === segCount - 1 ? n : start + segSize;
+    const slice: number[] = [];
+    for (let i = start; i < end; i++) slice.push(yValues[i]);
+    slice.sort((a, b) => a - b);
+    const idx = Math.floor(slice.length * 0.15);
+    env.push(slice[idx]);
+  }
+
+  let envMin = Infinity;
+  let envMax = -Infinity;
+  for (const v of env) {
+    if (v < envMin) envMin = v;
+    if (v > envMax) envMax = v;
+  }
+  const bgSpan = envMax - envMin;
+  let maxEnvCurv = 0;
+  for (let i = 1; i < env.length - 1; i++) {
+    const c = Math.abs(env[i + 1] - 2 * env[i] + env[i - 1]);
+    if (c > maxEnvCurv) maxEnvCurv = c;
+  }
+
+  // Estimate high-frequency noise via 2nd-difference MAD
+  const sqrt6 = Math.sqrt(6);
+  const d2: number[] = [];
+  for (let i = 1; i < n - 1; i++) {
+    d2.push((yValues[i + 1] - 2 * yValues[i] + yValues[i - 1]) / sqrt6);
+  }
+  d2.sort((a, b) => a - b);
+  const medD2 = d2[Math.floor(d2.length / 2)] ?? 0;
+  const absDev = d2.map((v) => Math.abs(v - medD2)).sort((a, b) => a - b);
+  const noiseSigma = 1.4826 * (absDev[Math.floor(absDev.length / 2)] ?? 0);
+
+  const fluorescenceRatio = bgSpan / totalSpan;
+  const curvatureRatio = bgSpan > 1e-6 ? maxEnvCurv / bgSpan : 0;
+  const noiseRatio = noiseSigma / totalSpan;
+
+  // Scale smoothness lambda with spectrum length so bandwidth is consistent across CCD sizes
+  const lenScale = Math.pow(n / 1000, 4);
+  let baseLambda: number;
+  let p: number;
+  let profile: AutoBaselineResult['profile'];
+
+  if (fluorescenceRatio > 0.25 || (fluorescenceRatio > 0.12 && curvatureRatio > 0.22)) {
+    // Strong or curved fluorescence background: tighter smoothing to track hump closely
+    profile = 'Fluorescent';
+    baseLambda = fluorescenceRatio > 0.5 ? 2e4 : 4e4;
+    p = noiseRatio > 0.025 ? 0.006 : 0.003;
+  } else if (fluorescenceRatio > 0.07) {
+    // Moderate sloping or broad drift
+    profile = 'Moderate';
+    baseLambda = 1.2e5;
+    p = noiseRatio > 0.025 ? 0.008 : 0.004;
+  } else {
+    // Flat / low-background spectrum: keep baseline very stiff so weak peaks stay intact
+    profile = 'Flat';
+    baseLambda = 6e5;
+    p = noiseRatio > 0.02 ? 0.01 : 0.006;
+  }
+
+  const lambda = Math.max(5e3, Math.min(5e6, Math.round(baseLambda * lenScale)));
+  const res = subtractBaseline(yValues, { lambda, p, iterations: 12 });
+  return { ...res, lambda, p, profile };
 }

@@ -294,6 +294,15 @@ export interface BaselineResult {
   corrected: Float64Array;
 }
 
+export interface AutoBaselineResult extends BaselineResult {
+  /** Automatically selected AsLS smoothness parameter λ. */
+  lambda: number;
+  /** Automatically selected AsLS asymmetry weight p. */
+  p: number;
+  /** Detected background profile classification. */
+  profile: 'Flat' | 'Moderate' | 'Fluorescent';
+}
+
 /**
  * High-level normalized summary designed for downstream apps like Digital-Traveller.
  */
@@ -315,6 +324,10 @@ export interface WdfInstrumentSummary {
   objective: string | null;
   objectiveMagnification: number | null;
   ndTransmissionPercent: number | null;
+  /** Calibrated full laser power in mW (recorded in WXIS 'Laser power mW' on Renishaw Virsa instruments). */
+  laserPowerMw: number | null;
+  /** Effective sample laser power in mW (laserPowerMw * ndTransmissionPercent / 100) for Virsa instruments, rounded to 2 decimal places max. */
+  effectiveLaserPowerMw: number | null;
   exposureTimeMs: number | null;
   accumulations: number;
   slitOpening: string | null;

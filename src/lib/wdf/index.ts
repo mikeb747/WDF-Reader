@@ -7,6 +7,7 @@ export {
   convertXAxis,
   detectPeaks,
   subtractBaseline,
+  autoSubtractBaseline,
   wdfToCsv,
   type SpectralTargetUnit,
 } from './parser';

@@ -8,6 +8,7 @@ import {
   getSpectrum,
   parseWdf,
   subtractBaseline,
+  autoSubtractBaseline,
   WdfBlockId,
   WdfDataType,
   WdfDataUnits,
@@ -345,6 +346,77 @@ test('subtractBaseline (AsLS) removes broad fluorescence background while preser
     if (siRes.corrected[i] > maxCorrected) maxCorrected = siRes.corrected[i];
   }
   assert.ok(maxCorrected > 29000, `Expected Si peak preserved > 29000, got ${maxCorrected}`);
+});
+
+test('computes Virsa effective laser power from WXIS Laser power mW and ND Transmission %', () => {
+  const enc = new TextEncoder();
+  const makeStrEntry = (typeChar: string, keyId: number, text: string): Uint8Array => {
+    const strBytes = enc.encode(text);
+    const out = new Uint8Array(8 + strBytes.byteLength);
+    const v = new DataView(out.buffer);
+    out[0] = typeChar.charCodeAt(0);
+    out[1] = 0;
+    v.setUint16(2, keyId, true);
+    v.setUint32(4, strBytes.byteLength, true);
+    out.set(strBytes, 8);
+    return out;
+  };
+  const makeFloat64Entry = (keyId: number, val: number): Uint8Array => {
+    const out = new Uint8Array(12);
+    const v = new DataView(out.buffer);
+    out[0] = 'q'.charCodeAt(0);
+    out[1] = 0;
+    v.setUint16(2, keyId, true);
+    v.setFloat64(4, val, true);
+    return out;
+  };
+
+  const psetBody = concatBytes([
+    makeStrEntry('k', 0x8001, 'Instrument type'),
+    makeStrEntry('k', 0x8002, 'Laser power mW'),
+    makeStrEntry('k', 0x8003, 'ND Transmission %'),
+    makeStrEntry('u', 0x8001, ' Virsa'),
+    makeFloat64Entry(0x8002, 40.5),
+    makeFloat64Entry(0x8003, 10),
+  ]);
+  const psetHeader = new Uint8Array(8);
+  const pv = new DataView(psetHeader.buffer);
+  enc.encodeInto('PSET', psetHeader.subarray(0, 4));
+  pv.setUint32(4, psetBody.byteLength, true);
+  const wxisBlock = buildBlock('WXIS', 0, concatBytes([psetHeader, psetBody]));
+
+  const baseWdf = createSyntheticMapWdf();
+  const virsaWdf = parseWdf(concatBytes([baseWdf, wxisBlock]));
+  assert.equal(virsaWdf.summary.instrumentType, 'Virsa');
+  assert.equal(virsaWdf.summary.laserPowerMw, 40.5);
+  assert.equal(virsaWdf.summary.ndTransmissionPercent, 10);
+  assert.equal(virsaWdf.summary.effectiveLaserPowerMw, 4.05);
+});
+
+test('autoSubtractBaseline adapts to fluorescent vs flat backgrounds and reveals subtle peaks', () => {
+  const n = 1000;
+  const fluorRaw = new Float64Array(n);
+  const flatRaw = new Float64Array(n);
+
+  // Deterministic pseudo-noise + steep fluorescence + subtle Raman peak (height 120 on 2500 bg)
+  for (let i = 0; i < n; i++) {
+    const noise = Math.sin(i * 12.9898) * 4;
+    const bg = 600 + 2500 * Math.exp(-Math.pow((i - 450) / 180, 2));
+    const subtlePeak = 120 * Math.exp(-Math.pow((i - 620) / 5, 2));
+    const mainPeak = 900 * Math.exp(-Math.pow((i - 320) / 6, 2));
+    fluorRaw[i] = bg + mainPeak + subtlePeak + noise;
+    flatRaw[i] = 100 + 5000 * Math.exp(-Math.pow((i - 500) / 5, 2)) + noise;
+  }
+
+  const fluorRes = autoSubtractBaseline(fluorRaw);
+  assert.equal(fluorRes.profile, 'Fluorescent');
+  // Subtle peak at idx 620 should remain clearly positive (~100-125) while background around idx 760 is ~0
+  assert.ok(fluorRes.corrected[620] > 80, `Expected subtle peak revealed > 80, got ${fluorRes.corrected[620]}`);
+  assert.ok(Math.abs(fluorRes.corrected[760]) < 25, `Expected flat background near 0, got ${fluorRes.corrected[760]}`);
+
+  const flatRes = autoSubtractBaseline(flatRaw);
+  assert.equal(flatRes.profile, 'Flat');
+  assert.ok(flatRes.lambda > fluorRes.lambda, 'Flat spectrum should use smoother lambda than fluorescent spectrum');
 });
 
 test('rejects invalid or truncated inputs cleanly', () => {

@@ -155,7 +155,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('spectrum');
   const [targetUnit, setTargetUnit] = useState<SpectralTargetUnit>('native');
   const [baselineEnabled, setBaselineEnabled] = useState(false);
-  const [baselineStrength, setBaselineStrength] = useState<BaselineStrength>('standard');
+  const [baselineStrength, setBaselineStrength] = useState<BaselineStrength>('auto');
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoadingSamples, setIsLoadingSamples] = useState(!IS_PWA_BUILD);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -335,6 +336,49 @@ export default function App() {
     }
   };
 
+  const handleUnloadSample = (id: string) => {
+    setSamples((prev) => {
+      const remaining = prev.filter((s) => s.id !== id);
+      if (selectedId === id) {
+        setSelectedId(remaining[0]?.id ?? null);
+      }
+      return remaining;
+    });
+  };
+
+  const handleUnloadSamples = (ids: string[]) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setSamples((prev) => {
+      const remaining = prev.filter((s) => !idSet.has(s.id));
+      if (selectedId && idSet.has(selectedId)) {
+        setSelectedId(remaining[0]?.id ?? null);
+      }
+      return remaining;
+    });
+  };
+
+  const handleSetSamplesVisible = (ids: string[], visible: boolean) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setSamples((prev) =>
+      prev.map((s) => (idSet.has(s.id) ? { ...s, visible } : s)),
+    );
+    if (visible) {
+      setSelectedId((curr) => curr ?? ids[0]);
+    }
+  };
+
+  const handleUnloadFolder = (folderName: string) => {
+    setSamples((prev) => {
+      const remaining = prev.filter((s) => s.folderName !== folderName);
+      if (selectedId && !remaining.some((s) => s.id === selectedId)) {
+        setSelectedId(remaining[0]?.id ?? null);
+      }
+      return remaining;
+    });
+  };
+
   const handleSetAllVisible = (visible: boolean) => {
     setSamples((prev) => {
       if (visible) {
@@ -359,6 +403,26 @@ export default function App() {
     IS_PWA_BUILD && (activeTab === 'blocks' || activeTab === 'export')
       ? 'spectrum'
       : activeTab;
+
+  const showChartFullscreen = isFullscreen && effectiveTab === 'spectrum' && Boolean(activeSample);
+
+  useEffect(() => {
+    if (!showChartFullscreen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showChartFullscreen]);
+
+  const handleSelectTab = (tab: ActiveTab) => {
+    setActiveTab(tab);
+    if (tab !== 'spectrum') {
+      setIsFullscreen(false);
+    }
+  };
 
   return (
     <div
@@ -420,7 +484,7 @@ export default function App() {
 
       <TopBar
         activeTab={effectiveTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={handleSelectTab}
         isPwaBuild={IS_PWA_BUILD}
       />
 
@@ -445,20 +509,30 @@ export default function App() {
       )}
 
       <div className="flex-1 flex flex-col lg:flex-row min-h-0">
-        <Sidebar
-          samples={samples}
-          selectedId={activeSample?.id ?? null}
-          onSelectSample={handleSelectSample}
-          onToggleSampleVisible={handleToggleSampleVisible}
-          onToggleFolderVisible={handleToggleFolderVisible}
-          onSetAllVisible={handleSetAllVisible}
-          onChangeSampleColor={handleChangeSampleColor}
-          onOpenFileClick={() => fileInputRef.current?.click()}
-          onOpenFolderClick={() => folderInputRef.current?.click()}
-          isDraggingFile={isDraggingFile}
-        />
+        {!showChartFullscreen && (
+          <Sidebar
+            samples={samples}
+            selectedId={activeSample?.id ?? null}
+            onSelectSample={handleSelectSample}
+            onToggleSampleVisible={handleToggleSampleVisible}
+            onToggleFolderVisible={handleToggleFolderVisible}
+            onSetSamplesVisible={handleSetSamplesVisible}
+            onUnloadSample={handleUnloadSample}
+            onUnloadSamples={handleUnloadSamples}
+            onUnloadFolder={handleUnloadFolder}
+            onSetAllVisible={handleSetAllVisible}
+            onChangeSampleColor={handleChangeSampleColor}
+            onOpenFileClick={() => fileInputRef.current?.click()}
+            onOpenFolderClick={() => folderInputRef.current?.click()}
+            isDraggingFile={isDraggingFile}
+          />
+        )}
 
-        <main className="flex-1 min-w-0 lg:overflow-y-auto bg-slate-50">
+        <main
+          className={`flex-1 min-w-0 bg-slate-50 ${
+            showChartFullscreen ? 'flex flex-col overflow-hidden' : 'lg:overflow-y-auto'
+          }`}
+        >
           {isLoadingSamples ? (
             <div className="p-8 text-sm text-slate-500 font-mono">
               Loading bundled Renishaw demo spectra…
@@ -509,6 +583,8 @@ export default function App() {
               onToggleSampleVisible={handleToggleSampleVisible}
               onSetAllVisible={handleSetAllVisible}
               onChangeSampleColor={handleChangeSampleColor}
+              isFullscreen={showChartFullscreen}
+              onToggleFullscreen={() => setIsFullscreen((prev) => !prev)}
             />
           ) : effectiveTab === 'instrument' ? (
             <InstrumentView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
