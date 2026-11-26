@@ -1,0 +1,6 @@
+{
+  "name": "WiRE Registry Studio",
+  "description": "Reusable TypeScript registry parser, typed data model, and extensible Virsa/WiRE diagnostics engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
