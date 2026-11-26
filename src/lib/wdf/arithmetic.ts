@@ -585,6 +585,7 @@ export function computeSpectrumArithmetic(input: SpectrumArithmeticInput): Spect
     origins: [],
     comment: formulaNote,
     mapArea: null,
+    maps: [],
     whiteLightImage: null,
     propertySets: {},
     measurementScript: null,

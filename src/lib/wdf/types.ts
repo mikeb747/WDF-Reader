@@ -138,7 +138,7 @@ export const WDF_BLOCK_DESCRIPTIONS: Record<string, string> = {
   WMAP: 'Spatial Map Area Geometry',
   WHTL: 'Embedded White-Light Optical Image',
   ZLDC: 'Zero Level & Dark Current Calibration (PSET)',
-  'MAP ': 'Map Data Layout (PSET)',
+  'MAP ': 'Map / Scan Analysis Result (PSET + Float32)',
   WCHK: 'File Integrity Checksum (SHA-1)',
   CFAR: 'Curvefit Analysis Results',
   DCLS: 'Component Analysis (DCLS) Results',
@@ -277,6 +277,25 @@ export interface WdfMapArea {
   lineFocusSize: number;
 }
 
+export interface WdfMapResult {
+  uid: number;
+  label: string;
+  mapType: number | null;
+  analysisType: number | null;
+  firstLimit: number | null;
+  secondLimit: number | null;
+  xListUnit: WdfDataUnits | null;
+  xListUnitSymbol: string;
+  xListType: WdfDataType | null;
+  dataRange: [number, number] | null;
+  /** Scalar analysis value per collected spectrum (e.g. integrated area under curve). */
+  values: Float32Array;
+  operator: string | null;
+  timestamp: string | null;
+  softwareVersion: string | null;
+  properties: PsetObject;
+}
+
 export interface WdfWhiteLightImage {
   mimeType: string;
   byteLength: number;
@@ -379,6 +398,8 @@ export interface WdfFile {
   origins: WdfOriginList[];
   comment: string | null;
   mapArea: WdfMapArea | null;
+  /** Embedded Renishaw MAP analysis results (e.g. Signal-to-Baseline integration per scan). */
+  maps: WdfMapResult[];
   whiteLightImage: WdfWhiteLightImage | null;
   /** Decoded Renishaw PSET property sets keyed by 4-char block ID (WXDA, WXIS, WXDM, WXCS, ZLDC, etc.) */
   propertySets: Record<string, PsetObject>;

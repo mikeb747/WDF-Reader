@@ -38,6 +38,8 @@ export const KNOWN_PSET_KEYS: Record<number, string> = {
   0x012e: 'ScanCompletionCode',
   0x0193: 'Properties',
   0x019b: 'OperationName',
+  0x019c: 'MapType',
+  0x01a4: 'AnalysisType',
   0x01ae: 'Operator',
   0x01af: 'Timestamp',
   0x01b0: 'SoftwareVersion',
@@ -307,15 +309,16 @@ function resolvePsetNode(node: RawPsetNode, inheritedKeys: Map<number, string>):
 }
 
 /**
- * Parse a PSET block payload starting at `payloadOffset` (where "PSET" magic begins).
+ * Parse a PSET block payload starting at `payloadOffset` (where "PSET" magic begins)
+ * and return both the decoded object and the byte offset immediately following the PSET stream.
  * Returns null if the "PSET" magic header is not present.
  */
-export function parsePsetBlock(
+export function parsePsetBlockWithEnd(
   view: DataView,
   bytes: Uint8Array,
   payloadOffset: number,
   blockEnd: number,
-): PsetObject | null {
+): { pset: PsetObject; nextOffset: number } | null {
   if (payloadOffset + 8 > blockEnd) return null;
   const magic = view.getUint32(payloadOffset, true);
   if (magic !== PSET_MAGIC) return null;
@@ -325,5 +328,22 @@ export function parsePsetBlock(
   const psetEnd = Math.min(psetStart + psetSize, blockEnd);
 
   const rawTree = parsePsetRaw(view, bytes, psetStart, psetEnd);
-  return resolvePsetNode(rawTree, new Map());
+  return {
+    pset: resolvePsetNode(rawTree, new Map()),
+    nextOffset: psetEnd,
+  };
+}
+
+/**
+ * Parse a PSET block payload starting at `payloadOffset` (where "PSET" magic begins).
+ * Returns null if the "PSET" magic header is not present.
+ */
+export function parsePsetBlock(
+  view: DataView,
+  bytes: Uint8Array,
+  payloadOffset: number,
+  blockEnd: number,
+): PsetObject | null {
+  const res = parsePsetBlockWithEnd(view, bytes, payloadOffset, blockEnd);
+  return res ? res.pset : null;
 }

@@ -1,15 +1,18 @@
 export * from './types';
-export { parsePsetBlock, filetimeToIso, KNOWN_PSET_KEYS } from './pset';
+export { parsePsetBlock, parsePsetBlockWithEnd, filetimeToIso, KNOWN_PSET_KEYS } from './pset';
 export {
   parseWdf,
   parseWdfFile,
   getSpectrum,
   convertXAxis,
+  computeSignalToBaselineMap,
   detectPeaks,
   subtractBaseline,
   autoSubtractBaseline,
   wdfToCsv,
   type SpectralTargetUnit,
+  type IntegrationMode,
+  type ComputedIntegrationMap,
 } from './parser';
 export {
   parseArithmeticExpression,

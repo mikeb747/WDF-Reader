@@ -17,6 +17,7 @@ import {
 } from '../lib/wdf';
 import { stripWdfExtension } from '../lib/format';
 import { DataArithmeticModal } from './DataArithmeticModal';
+import { ScanMapChart, type ActiveIntegrationWindow } from './ScanMapChart';
 import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
@@ -406,6 +407,7 @@ export function SpectrumView({
   const [peakPickingMode, setPeakPickingMode] = useState(false);
   const [snapToLocalPeak, setSnapToLocalPeak] = useState(true);
   const [pickedPeaks, setPickedPeaks] = useState<PickedPeakEntry[]>([]);
+  const [integrationWindow, setIntegrationWindow] = useState<ActiveIntegrationWindow | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const plotAreaRef = useRef<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({
@@ -984,6 +986,57 @@ export function SpectrumView({
   ]);
 
   const totalSpectra = Math.max(1, Math.floor(wdf.spectra.length / Math.max(1, wdf.header.pointsPerSpectrum)));
+
+  // Project active integration window bounds into the currently displayed X-axis unit
+  const shadedIntegrationRange = useMemo(() => {
+    if (!integrationWindow || isMultiOverlay || !wdf.xAxis) return null;
+    let x1 = integrationWindow.fromX;
+    let x2 = integrationWindow.toX;
+
+    if (integrationWindow.xListUnit !== null && effectiveUnit !== 'native') {
+      const dummyAxis = {
+        dataType: wdf.xAxis.dataType,
+        dataTypeName: wdf.xAxis.dataTypeName,
+        units: integrationWindow.xListUnit,
+        unitsName: '',
+        unitsSymbol: '',
+        values: new Float32Array([x1, x2]),
+      };
+      const converted = convertXAxis(dummyAxis, wdf.header.laserWavenumber, effectiveUnit);
+      x1 = converted.values[0];
+      x2 = converted.values[1];
+    } else if (
+      integrationWindow.xListUnit !== null &&
+      effectiveUnit === 'native' &&
+      integrationWindow.xListUnit !== wdf.xAxis.units
+    ) {
+      const nativeTarget = wdfUnitToTargetUnit(wdf.xAxis.units);
+      if (nativeTarget) {
+        const dummyAxis = {
+          dataType: wdf.xAxis.dataType,
+          dataTypeName: wdf.xAxis.dataTypeName,
+          units: integrationWindow.xListUnit,
+          unitsName: '',
+          unitsSymbol: '',
+          values: new Float32Array([x1, x2]),
+        };
+        const converted = convertXAxis(dummyAxis, wdf.header.laserWavenumber, nativeTarget);
+        x1 = converted.values[0];
+        x2 = converted.values[1];
+      }
+    }
+
+    const lo = Math.min(x1, x2);
+    const hi = Math.max(x1, x2);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    if (hi < viewDomain.xMin || lo > viewDomain.xMax) return null;
+
+    return {
+      lo,
+      hi,
+      label: integrationWindow.label,
+    };
+  }, [integrationWindow, isMultiOverlay, wdf, effectiveUnit, viewDomain.xMin, viewDomain.xMax]);
 
   const mapGrid = useMemo(() => {
     if (!wdf.mapArea || totalSpectra <= 1) return null;
@@ -1836,6 +1889,75 @@ export function SpectrumView({
 
               {/* Clipped Data Layer */}
               <g clipPath="url(#plotClip)">
+                {/* Shaded Integration Window (when viewing a multi-scan MAP / Area Under Curve) */}
+                {shadedIntegrationRange && (() => {
+                  const xLeft = mapX(shadedIntegrationRange.lo);
+                  const xRight = mapX(shadedIntegrationRange.hi);
+                  const boxX = Math.min(xLeft, xRight);
+                  const boxW = Math.max(1, Math.abs(xRight - xLeft));
+                  return (
+                    <g data-testid="integration-window-band" pointerEvents="none">
+                      <rect
+                        x={boxX}
+                        y={margin.top}
+                        width={boxW}
+                        height={plotH}
+                        fill="#2563EB"
+                        fillOpacity="0.07"
+                      />
+                      <line
+                        x1={xLeft}
+                        y1={margin.top}
+                        x2={xLeft}
+                        y2={margin.top + plotH}
+                        stroke="#2563EB"
+                        strokeOpacity="0.45"
+                        strokeWidth="1"
+                        strokeDasharray="4 3"
+                      />
+                      <line
+                        x1={xRight}
+                        y1={margin.top}
+                        x2={xRight}
+                        y2={margin.top + plotH}
+                        stroke="#2563EB"
+                        strokeOpacity="0.45"
+                        strokeWidth="1"
+                        strokeDasharray="4 3"
+                      />
+                      {(() => {
+                        const labelText = `Map: ${shadedIntegrationRange.label}`;
+                        const approxW = labelText.length * 6.2 + 8;
+                        const fitsRight = boxX + boxW + 6 + approxW <= margin.left + plotW - 4;
+                        const fitsLeft = boxX - 6 - approxW >= margin.left + 4;
+                        const labelX = fitsRight
+                          ? boxX + boxW + 6
+                          : fitsLeft
+                            ? boxX - 6
+                            : boxX + boxW / 2;
+                        const anchor = fitsRight ? 'start' : fitsLeft ? 'end' : 'middle';
+                        const labelY = fitsRight || fitsLeft ? margin.top + 14 : margin.top + plotH - 6;
+                        return (
+                          <text
+                            x={labelX}
+                            y={labelY}
+                            textAnchor={anchor}
+                            fontSize="10"
+                            fontFamily="IBM Plex Mono, monospace"
+                            fontWeight="500"
+                            fill="#1D4ED8"
+                            stroke="#FFFFFF"
+                            strokeWidth="3"
+                            paintOrder="stroke"
+                          >
+                            {labelText}
+                          </text>
+                        );
+                      })()}
+                    </g>
+                  );
+                })()}
+
                 {/* Zero reference line when baseline correction is active */}
                 {baselineEnabled && viewDomain.yMin < 0 && viewDomain.yMax > 0 && (
                   <line
@@ -2168,6 +2290,20 @@ export function SpectrumView({
           </div>
         </div>
       </div>
+
+      {/* Scan Integration / Map Plot (multi-scan series or embedded Renishaw MAP block) */}
+      {!isFullscreen && !isMultiOverlay && (wdf.maps.length > 0 || totalSpectra > 1) && (
+        <ScanMapChart
+          wdf={wdf}
+          fileName={fileName}
+          traceColor={primaryTrace.color}
+          spectrumIndex={spectrumIndex}
+          totalSpectra={totalSpectra}
+          targetUnit={effectiveUnit}
+          onSelectSpectrum={setSpectrumIndex}
+          onIntegrationWindowChange={setIntegrationWindow}
+        />
+      )}
 
       {/* Multi-Spectrum Scrubber (single-file series / map) */}
       {!isMultiOverlay && totalSpectra > 1 && (

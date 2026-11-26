@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  computeSignalToBaselineMap,
   convertXAxis,
   detectPeaks,
   getSpectrum,
@@ -28,6 +29,10 @@ const SAMPLE_520_PATH = path.resolve(
 const SAMPLE_PCL_PATH = path.resolve(
   process.cwd(),
   'public/assets/aistudio/532nm_1800_17087_abs_cm-1_PCL_e8762f36.txt',
+);
+const SAMPLE_SI_MAP_PATH = path.resolve(
+  process.cwd(),
+  'public/assets/aistudio/03.Silicon_Efficiency_520_d1b4959c.txt',
 );
 
 function buildBlock(id: string, uid: number, payload: Uint8Array): Uint8Array {
@@ -531,6 +536,53 @@ test('smoothSpectrumSavitzkyGolay and autoSmoothSpectrum reduce high-frequency n
     if (siAuto.smoothed[i] > siAuto.smoothed[maxIdx]) maxIdx = i;
   }
   assert.ok(Math.abs(siWdf.xAxis.values[maxIdx] - 519.94) < 0.5);
+});
+
+test('parses real Renishaw multi-scan MAP block and matches computeSignalToBaselineMap across all 40 scans', () => {
+  const buf = fs.readFileSync(SAMPLE_SI_MAP_PATH);
+  const wdf = parseWdf(buf);
+
+  assert.equal(wdf.warnings.length, 0);
+  assert.equal(wdf.header.spectraCollected, 40);
+  assert.equal(wdf.header.capacity, 1000);
+  assert.equal(wdf.header.pointsPerSpectrum, 1015);
+  assert.equal(wdf.spectra.length, 40 * 1015);
+  assert.equal(wdf.summary.instrumentType, 'Virsa');
+  assert.equal(wdf.summary.effectiveLaserPowerMw, 35);
+
+  // Verify embedded Renishaw MAP block metadata and values
+  assert.equal(wdf.maps.length, 1);
+  const map = wdf.maps[0];
+  assert.equal(map.label, 'Signal To Baseline from 480.00 To 560.00');
+  assert.equal(map.firstLimit, 480);
+  assert.equal(map.secondLimit, 560);
+  assert.equal(map.xListUnit, WdfDataUnits.RamanShift);
+  assert.equal(map.xListUnitSymbol, 'cm⁻¹');
+  assert.equal(map.values.length, 40, 'Should clamp to 40 collected scans without trailing 0 or NaN padding');
+
+  for (let i = 0; i < map.values.length; i++) {
+    assert.ok(Number.isFinite(map.values[i]) && map.values[i] > 0, `Scan ${i + 1} value must be finite positive`);
+  }
+  assert.ok(Math.abs(map.values[0] - 279918.5) < 0.5, `Scan 1 expected ~279918.5, got ${map.values[0]}`);
+  assert.ok(Math.abs(map.values[2] - 282187.09) < 0.5, `Scan 3 expected ~282187.09, got ${map.values[2]}`);
+  assert.ok(Math.abs(map.values[19] - 166814.16) < 0.5, `Scan 20 dip expected ~166814.16, got ${map.values[19]}`);
+
+  // Verify live computeSignalToBaselineMap matches embedded Renishaw WiRE values across ALL 40 scans
+  const computed = computeSignalToBaselineMap(wdf, 480, 560);
+  assert.equal(computed.values.length, 40);
+  for (let i = 0; i < 40; i++) {
+    const relErr = Math.abs(computed.values[i] - map.values[i]) / Math.max(1, Math.abs(map.values[i]));
+    assert.ok(
+      relErr < 1e-4,
+      `Scan ${i + 1} mismatch: computed=${computed.values[i]} vs wire=${map.values[i]} (relErr=${relErr})`,
+    );
+  }
+
+  // Swapped limits (560, 480) must produce identical results, and totalArea > signalToBaseline for positive baseline
+  const swapped = computeSignalToBaselineMap(wdf, 560, 480);
+  assert.ok(Math.abs(swapped.values[0] - computed.values[0]) < 1e-3);
+  const total = computeSignalToBaselineMap(wdf, 480, 560, { mode: 'totalArea' });
+  assert.ok(total.values[0] > computed.values[0]);
 });
 
 test('rejects invalid or truncated inputs cleanly', () => {

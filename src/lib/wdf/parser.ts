@@ -3,7 +3,7 @@
  * Designed for drop-in use in Digital-Traveller (both Node.js and Browser).
  */
 
-import { decodeUtf8Trimmed, filetimeToIso, parsePsetBlock } from './pset';
+import { decodeUtf8Trimmed, filetimeToIso, parsePsetBlock, parsePsetBlockWithEnd } from './pset';
 import {
   getDataTypeName,
   getMeasurementTypeName,
@@ -27,6 +27,7 @@ import {
   type WdfHeader,
   type WdfInstrumentSummary,
   type WdfMapArea,
+  type WdfMapResult,
   type WdfOriginList,
   type WdfParseOptions,
   type WdfPeak,
@@ -268,6 +269,109 @@ function readMapAreaBlock(view: DataView, offset: number, size: number): WdfMapA
   };
 }
 
+function readMapResultBlock(
+  view: DataView,
+  bytes: Uint8Array,
+  offset: number,
+  blockEnd: number,
+  uid: number,
+  spectraCollected: number,
+): { pset: PsetObject; mapResult: WdfMapResult } | null {
+  const parsedPset = parsePsetBlockWithEnd(view, bytes, offset + 16, blockEnd);
+  if (!parsedPset) return null;
+
+  const { pset, nextOffset } = parsedPset;
+  const remaining = blockEnd - nextOffset;
+  let values = new Float32Array(0);
+
+  if (remaining >= 8) {
+    // Support both legacy PSET float-array trailer ('r', 0x80, key, uint32 count) and
+    // standard WiRE MAP trailer (uint64 count followed by Float32 values).
+    let floatStart = nextOffset + 8;
+    let rawCount = 0;
+
+    if (bytes[nextOffset] === 0x72 && (bytes[nextOffset + 1] & 0x80) !== 0) {
+      rawCount = view.getUint32(nextOffset + 4, true);
+      floatStart = nextOffset + 8;
+    } else {
+      const count64 = view.getBigUint64(nextOffset, true);
+      rawCount = count64 <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(count64) : 0;
+      floatStart = nextOffset + 8;
+    }
+
+    const availableFloats = Math.max(0, Math.floor((blockEnd - floatStart) / 4));
+    // Clamp to header.spectraCollected when available so uncollected/aborted capacity slots
+    // (trailing 0 or NaN padding) never pollute the map plot.
+    let targetCount = availableFloats;
+    if (rawCount > 0) {
+      targetCount = Math.min(targetCount, rawCount);
+    }
+    if (spectraCollected > 0) {
+      targetCount = Math.min(targetCount, spectraCollected);
+    }
+
+    const rawValues: number[] = [];
+    for (let i = 0; i < targetCount; i++) {
+      const v = view.getFloat32(floatStart + i * 4, true);
+      if (Number.isFinite(v)) {
+        rawValues.push(v);
+      } else {
+        // Stop at trailing NaN padding in partially collected series
+        if (spectraCollected <= 0) break;
+        rawValues.push(NaN);
+      }
+    }
+    values = Float32Array.from(rawValues);
+  }
+
+  const props = asObject(pset['Properties']);
+  const firstLimit = asNumber(props?.['FirstLimit']);
+  const secondLimit = asNumber(props?.['SecondLimit']);
+  const xListUnitNum = asNumber(props?.['XlistUnit']);
+  const xListUnit = xListUnitNum !== null ? (xListUnitNum as WdfDataUnits) : null;
+  const xListUnitSymbol = xListUnit !== null ? getUnitInfo(xListUnit).symbol : '';
+  const xListTypeNum = asNumber(props?.['XlistType']);
+  const xListType = xListTypeNum !== null ? (xListTypeNum as WdfDataType) : null;
+
+  let dataRange: [number, number] | null = null;
+  const rawRange = pset['dataRange'];
+  if (Array.isArray(rawRange) && rawRange.length >= 2) {
+    const r0 = asNumber(rawRange[0]);
+    const r1 = asNumber(rawRange[1]);
+    if (r0 !== null && r1 !== null) {
+      dataRange = [r0, r1];
+    }
+  }
+
+  const label =
+    asString(pset['OperationName']) ??
+    asString(pset['Title']) ??
+    (firstLimit !== null && secondLimit !== null
+      ? `Map Integration (${firstLimit.toFixed(2)} – ${secondLimit.toFixed(2)})`
+      : `Map Result #${uid}`);
+
+  return {
+    pset,
+    mapResult: {
+      uid,
+      label,
+      mapType: asNumber(pset['MapType']),
+      analysisType: asNumber(pset['AnalysisType']),
+      firstLimit,
+      secondLimit,
+      xListUnit,
+      xListUnitSymbol,
+      xListType,
+      dataRange,
+      values,
+      operator: asString(pset['Operator']),
+      timestamp: asString(pset['Timestamp']),
+      softwareVersion: asString(pset['SoftwareVersion']),
+      properties: pset,
+    },
+  };
+}
+
 function readWhiteLightImage(bytes: Uint8Array, offset: number, size: number): WdfWhiteLightImage | null {
   if (size <= 16) return null;
   const payload = bytes.slice(offset + 16, offset + size);
@@ -498,6 +602,7 @@ export function parseWdf(
   let origins: WdfOriginList[] = [];
   let comment: string | null = null;
   let mapArea: WdfMapArea | null = null;
+  const maps: WdfMapResult[] = [];
   let whiteLightImage: WdfWhiteLightImage | null = null;
   let measurementScript: string | null = null;
 
@@ -588,8 +693,26 @@ export function parseWdf(
         parsed = whiteLightImage !== null;
         break;
 
+      case WdfBlockId.MAP: {
+        const res = readMapResultBlock(
+          view,
+          bytes,
+          offset,
+          blockEnd,
+          uid,
+          header?.spectraCollected ?? 0,
+        );
+        if (res !== null) {
+          maps.push(res.mapResult);
+          const psetKey = id in propertySets ? `${id}#${uid}` : id;
+          propertySets[psetKey] = res.pset;
+          parsed = true;
+        }
+        break;
+      }
+
       default: {
-        // Attempt PSET decoding for WXDA, WXDM, WXCS, WXIS, ZLDC, WXDB, MAP , and custom PSET blocks
+        // Attempt PSET decoding for WXDA, WXDM, WXCS, WXIS, ZLDC, WXDB, and custom PSET blocks
         const pset = parsePsetBlock(view, bytes, offset + 16, blockEnd);
         if (pset !== null) {
           if (id === WdfBlockId.WXDM && typeof pset['MeasurementScript'] === 'string') {
@@ -649,6 +772,7 @@ export function parseWdf(
     origins,
     comment,
     mapArea,
+    maps,
     whiteLightImage,
     propertySets,
     measurementScript,
@@ -761,6 +885,156 @@ export function convertXAxis(
   };
 
   return { values: out, ...labels[target] };
+}
+
+export type IntegrationMode = 'signalToBaseline' | 'totalArea';
+
+export interface ComputedIntegrationMap {
+  values: Float32Array;
+  fromX: number;
+  toX: number;
+  mode: IntegrationMode;
+  unitLabel: string;
+  unitSymbol: string;
+}
+
+/**
+ * Compute integrated area under the curve across all collected spectra in a WDF file
+ * between `fromX` and `toX`.
+ *
+ * - `'signalToBaseline'` (default): matches Renishaw WiRE's "Signal To Baseline" algorithm —
+ *   trapezoidal integration of `(y(x) - linearBaseline(x))` over the clipped interval `[lo, hi]`
+ *   with linearly interpolated endpoints `y(lo)` and `y(hi)`.
+ * - `'totalArea'`: trapezoidal area under `y(x)` above `y = 0` over `[lo, hi]`.
+ */
+export function computeSignalToBaselineMap(
+  wdf: WdfFile,
+  fromX: number,
+  toX: number,
+  options: { targetUnit?: SpectralTargetUnit; mode?: IntegrationMode } = {},
+): ComputedIntegrationMap {
+  const mode: IntegrationMode = options.mode ?? 'signalToBaseline';
+  const pts = wdf.header.pointsPerSpectrum;
+  const totalSpectra = pts > 0 ? Math.floor(wdf.spectra.length / pts) : 0;
+
+  if (!wdf.xAxis || pts <= 1 || totalSpectra <= 0) {
+    return {
+      values: new Float32Array(0),
+      fromX: Math.min(fromX, toX),
+      toX: Math.max(fromX, toX),
+      mode,
+      unitLabel: wdf.xAxis?.unitsName ?? 'X',
+      unitSymbol: wdf.xAxis?.unitsSymbol ?? '',
+    };
+  }
+
+  const converted = convertXAxis(
+    wdf.xAxis,
+    wdf.header.laserWavenumber,
+    options.targetUnit ?? 'native',
+  );
+  const n = Math.min(converted.values.length, pts);
+
+  // Build ascending X ordering once and reuse across every collected scan
+  const order = new Int32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  order.sort((a, b) => converted.values[a] - converted.values[b]);
+
+  const sortedX = new Float64Array(n);
+  for (let i = 0; i < n; i++) sortedX[i] = converted.values[order[i]];
+
+  const lo = Math.min(fromX, toX);
+  const hi = Math.max(fromX, toX);
+  const out = new Float32Array(totalSpectra);
+
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo || hi <= sortedX[0] || lo >= sortedX[n - 1]) {
+    return {
+      values: out,
+      fromX: lo,
+      toX: hi,
+      mode,
+      unitLabel: converted.label,
+      unitSymbol: converted.symbol,
+    };
+  }
+
+  // Clamp requested integration limits to available X domain
+  const effLo = Math.max(lo, sortedX[0]);
+  const effHi = Math.min(hi, sortedX[n - 1]);
+  const span = effHi - effLo;
+  if (span <= 0) {
+    return {
+      values: out,
+      fromX: effLo,
+      toX: effHi,
+      mode,
+      unitLabel: converted.label,
+      unitSymbol: converted.symbol,
+    };
+  }
+
+  // Locate interpolation bracket for effLo and effHi once
+  const findBracket = (target: number): { i0: number; i1: number; t: number } => {
+    if (target <= sortedX[0]) return { i0: 0, i1: 0, t: 0 };
+    if (target >= sortedX[n - 1]) return { i0: n - 1, i1: n - 1, t: 0 };
+    let left = 0;
+    let right = n - 1;
+    while (right - left > 1) {
+      const mid = (left + right) >> 1;
+      if (sortedX[mid] <= target) left = mid;
+      else right = mid;
+    }
+    const dx = sortedX[right] - sortedX[left];
+    const t = dx > 0 ? (target - sortedX[left]) / dx : 0;
+    return { i0: left, i1: right, t };
+  };
+
+  const bLo = findBracket(effLo);
+  const bHi = findBracket(effHi);
+
+  // Interior sorted indices strictly inside (effLo, effHi)
+  let firstInner = bLo.i0;
+  while (firstInner < n && sortedX[firstInner] <= effLo) firstInner++;
+  let lastInner = bHi.i1;
+  while (lastInner >= 0 && sortedX[lastInner] >= effHi) lastInner--;
+
+  for (let s = 0; s < totalSpectra; s++) {
+    const baseOffset = s * pts;
+    const yAtSorted = (si: number) => wdf.spectra[baseOffset + order[si]];
+
+    const yLo = yAtSorted(bLo.i0) + bLo.t * (yAtSorted(bLo.i1) - yAtSorted(bLo.i0));
+    const yHi = yAtSorted(bHi.i0) + bHi.t * (yAtSorted(bHi.i1) - yAtSorted(bHi.i0));
+
+    let totalTrap = 0;
+    let prevX = effLo;
+    let prevY = yLo;
+
+    for (let si = firstInner; si <= lastInner; si++) {
+      const curX = sortedX[si];
+      const curY = yAtSorted(si);
+      totalTrap += 0.5 * (prevY + curY) * (curX - prevX);
+      prevX = curX;
+      prevY = curY;
+    }
+    totalTrap += 0.5 * (prevY + yHi) * (effHi - prevX);
+
+    if (mode === 'signalToBaseline') {
+      // Exact integral of straight-line baseline between (effLo, yLo) and (effHi, yHi)
+      const baselineArea = 0.5 * (yLo + yHi) * span;
+      out[s] = totalTrap - baselineArea;
+    } else {
+      out[s] = totalTrap;
+    }
+  }
+
+  return {
+    values: out,
+    fromX: effLo,
+    toX: effHi,
+    mode,
+    unitLabel: converted.label,
+    unitSymbol: converted.symbol,
+  };
 }
 
 function computePeakFwhm(
