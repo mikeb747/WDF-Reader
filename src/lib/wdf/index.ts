@@ -30,3 +30,10 @@ export {
   type SmoothOptions,
   type AutoSmoothResult,
 } from './smoothing';
+export {
+  fitGaussianPeak,
+  sampleGaussianPeakCurve,
+  interpolateAxisAtPixel,
+  type GaussianPeakFit,
+  type SampledCurvePoint,
+} from './curveFit';

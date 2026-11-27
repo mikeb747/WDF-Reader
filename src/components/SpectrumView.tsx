@@ -1,16 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Calculator, Crosshair, Layers, Maximize2, Minimize2, RotateCcw, Rows3, SlidersHorizontal, Trash2, Waves, X } from 'lucide-react';
+import { Calculator, Crosshair, Layers, Maximize2, Minimize2, RotateCcw, Rows3, SlidersHorizontal, Trash2, Waves, X, ZoomIn } from 'lucide-react';
 import {
   autoSmoothSpectrum,
   autoSubtractBaseline,
   convertXAxis,
   detectPeaks,
+  fitGaussianPeak,
   getSpectrum,
+  interpolateAxisAtPixel,
+  sampleGaussianPeakCurve,
   smoothSpectrumSavitzkyGolay,
   subtractBaseline,
   WdfDataUnits,
   type AutoBaselineResult,
   type AutoSmoothResult,
+  type GaussianPeakFit,
   type SpectralTargetUnit,
   type WdfFile,
   type WdfPeak,
@@ -117,12 +121,28 @@ function formatTick(val: number, step: number): string {
   });
 }
 
+interface ComputedCurveFit {
+  fit: GaussianPeakFit;
+  xPeakCalibrated: number;
+  yPeakDisplay: number;
+  fwhmCalibrated: number | null;
+  samples: Array<{ pixel: number; x: number; y: number }>;
+  windowPoints: Array<{ pixel: number; x: number; y: number }>;
+  zoomMinX: number;
+  zoomMaxX: number;
+}
+
 interface ComputedTrace {
   id: string;
   fileName: string;
   title: string;
   color: string;
   points: Array<{ x: number; y: number; rawY: number; baselineY: number; origIdx: number }>;
+  workingY: Float64Array;
+  xs: Float64Array;
+  scaleMin: number;
+  scaleSpan: number;
+  isNormalized: boolean;
   label: string;
   symbol: string;
   minX: number;
@@ -132,10 +152,79 @@ interface ComputedTrace {
   meanY: number;
   peak: { x: number; y: number; origIdx: number } | null;
   peaks: WdfPeak[];
+  peakFit: ComputedCurveFit | null;
   autoBaselineProfile?: AutoBaselineResult['profile'];
   autoBaselineLambda?: number;
   smoothWindowSize?: number;
   autoSmoothProfile?: AutoSmoothResult['profile'];
+}
+
+const WARM_TRACE_COLORS = new Set(['#ea580c', '#dc2626', '#e11d48', '#d97706', '#9a3412', '#f97316']);
+
+function getCurveFitStrokeColor(traceColor: string): string {
+  return WARM_TRACE_COLORS.has(traceColor.toLowerCase()) ? '#0D9488' : '#EA580C';
+}
+
+function buildComputedCurveFit(
+  workingY: Float64Array,
+  xs: Float64Array,
+  peakIdx: number,
+  normalize: boolean,
+  scaleMin: number,
+  scaleSpan: number,
+): ComputedCurveFit | null {
+  const n = workingY.length;
+  if (n === 0 || peakIdx < 0 || peakIdx >= n) return null;
+
+  const fit = fitGaussianPeak(workingY, peakIdx);
+  const toDisplayY = (v: number) => (normalize ? ((v - scaleMin) / scaleSpan) * 100 : v);
+  const xPeakCalibrated = interpolateAxisAtPixel(xs, fit.xPeak);
+  const yPeakDisplay = toDisplayY(fit.yPeak);
+
+  let fwhmCalibrated: number | null = null;
+  if (fit.fwhm !== null && n >= 2) {
+    const lo = Math.max(0, peakIdx - 1);
+    const hi = Math.min(n - 1, peakIdx + 1);
+    const stepX = Math.abs(xs[hi] - xs[lo]) / Math.max(1, hi - lo);
+    if (Number.isFinite(stepX) && stepX > 0) {
+      fwhmCalibrated = fit.fwhm * stepX;
+    }
+  }
+
+  const samples = fit.isFallback
+    ? []
+    : sampleGaussianPeakCurve(fit, n, 3, 0.05).map((pt) => ({
+        pixel: pt.pixel,
+        x: interpolateAxisAtPixel(xs, pt.pixel),
+        y: toDisplayY(pt.intensity),
+      }));
+
+  const windowPoints: Array<{ pixel: number; x: number; y: number }> = [];
+  const winStart = Math.max(0, peakIdx - 2);
+  const winEnd = Math.min(n - 1, peakIdx + 2);
+  for (let i = winStart; i <= winEnd; i++) {
+    windowPoints.push({
+      pixel: i,
+      x: xs[i],
+      y: toDisplayY(workingY[i]),
+    });
+  }
+
+  const zoomLoIdx = Math.max(0, peakIdx - 10);
+  const zoomHiIdx = Math.min(n - 1, peakIdx + 10);
+  const zoomMinX = Math.min(xs[zoomLoIdx], xs[zoomHiIdx]);
+  const zoomMaxX = Math.max(xs[zoomLoIdx], xs[zoomHiIdx]);
+
+  return {
+    fit,
+    xPeakCalibrated,
+    yPeakDisplay,
+    fwhmCalibrated,
+    samples,
+    windowPoints,
+    zoomMinX,
+    zoomMaxX,
+  };
 }
 
 interface PickedPeakEntry {
@@ -164,6 +253,7 @@ function buildTrace(
   baselineEnabled: boolean,
   baselineStrength: BaselineStrength,
   normalize: boolean,
+  curveFitEnabled: boolean,
 ): ComputedTrace | null {
   if (!wdf.xAxis) return null;
   const converted = convertXAxis(wdf.xAxis, wdf.header.laserWavenumber, targetUnit);
@@ -226,19 +316,30 @@ function buildTrace(
     workingY = denoisedY;
   }
 
-  // Optional 0-100% normalization for multi-file overlay comparison
+  // Locate primary discrete maximum on workingY before normalization so Curve Fit runs on true intensities
+  let minV = Infinity;
+  let maxV = -Infinity;
+  let rawPeakIdx = 0;
+  for (let i = 0; i < workingY.length; i++) {
+    const v = workingY[i];
+    if (v < minV) minV = v;
+    if (v > maxV) {
+      maxV = v;
+      rawPeakIdx = i;
+    }
+  }
+
+  const primaryFitRaw = fitGaussianPeak(workingY, rawPeakIdx);
+
+  // Optional 0-100% normalization: when Curve Fit is ON, normalize both discrete data and fitted curve
+  // relative to fitted yPeak so the fitted peak crest equals 100%.
   let scaleMin = 0;
   let scaleSpan = 1;
   if (normalize) {
-    let minV = Infinity;
-    let maxV = -Infinity;
-    for (let i = 0; i < workingY.length; i++) {
-      if (workingY[i] < minV) minV = workingY[i];
-      if (workingY[i] > maxV) maxV = workingY[i];
-    }
     scaleMin = baselineEnabled ? 0 : minV;
-    scaleSpan = maxV - scaleMin;
-    if (scaleSpan <= 0) scaleSpan = 1;
+    const referencePeak = curveFitEnabled ? primaryFitRaw.yPeak : maxV;
+    const candidateSpan = referencePeak - scaleMin;
+    scaleSpan = candidateSpan > 1e-9 ? candidateSpan : Math.max(maxV - scaleMin, 1);
   }
 
   const points: ComputedTrace['points'] = [];
@@ -272,6 +373,7 @@ function buildTrace(
     sumY += y;
   }
 
+  const peakFit = buildComputedCurveFit(workingY, xs, rawPeakIdx, normalize, scaleMin, scaleSpan);
   const peaks = detectPeaks(xs, ys, 5, 16);
 
   const cleanName = stripWdfExtension(fileName);
@@ -283,6 +385,11 @@ function buildTrace(
     title: cleanTitle,
     color,
     points,
+    workingY,
+    xs,
+    scaleMin,
+    scaleSpan,
+    isNormalized: normalize,
     label: converted.label,
     symbol: converted.symbol,
     minX,
@@ -292,6 +399,7 @@ function buildTrace(
     meanY: points.length > 0 ? sumY / points.length : 0,
     peak: points[peakIdx] ? { x: points[peakIdx].x, y: points[peakIdx].y, origIdx: points[peakIdx].origIdx } : null,
     peaks,
+    peakFit,
     autoBaselineProfile,
     autoBaselineLambda,
     smoothWindowSize,
@@ -395,6 +503,7 @@ export function SpectrumView({
 }: SpectrumViewProps) {
   const [spectrumIndex, setSpectrumIndex] = useState(0);
   const [showPeaks, setShowPeaks] = useState(true);
+  const [curveFitEnabled, setCurveFitEnabled] = useState(true);
   const [sortAscending, setSortAscending] = useState(true);
   const [showFittedBaseline, setShowFittedBaseline] = useState(false);
   const [normalizeOverlay, setNormalizeOverlay] = useState(false);
@@ -459,7 +568,7 @@ export function SpectrumView({
   useEffect(() => {
     setZoomRange(null);
     setHoverDataX(null);
-  }, [targetUnit, sortAscending, visibleSamples.length, baselineEnabled, normalizeOverlay]);
+  }, [targetUnit, sortAscending, visibleSamples.length, baselineEnabled]);
 
   // White-light optical image URL (if embedded in WHTL block)
   const whiteLightUrl = useMemo(() => {
@@ -505,7 +614,8 @@ export function SpectrumView({
         smoothStrength,
         baselineEnabled,
         baselineStrength,
-        isMultiOverlay && normalizeOverlay,
+        normalizeOverlay,
+        curveFitEnabled,
       );
       if (trace) list.push(trace);
     }
@@ -520,12 +630,59 @@ export function SpectrumView({
     smoothStrength,
     baselineEnabled,
     baselineStrength,
-    isMultiOverlay,
     normalizeOverlay,
+    curveFitEnabled,
   ]);
 
   const primaryTrace = traces.find((t) => t.id === activeSampleId) ?? traces[0] ?? null;
   const isAutoOffsetActive = isMultiOverlay && autoOffset;
+
+  // Resolve the active Gaussian curve fit for each trace (uses primary global peak fit, or fits
+  // the highest visible peak when the user zooms into a region that excludes the global peak).
+  const activeTraceFits = useMemo(() => {
+    const map = new Map<string, ComputedCurveFit>();
+    if (!curveFitEnabled) return map;
+    const zMin = zoomRange ? Math.min(zoomRange[0], zoomRange[1]) : null;
+    const zMax = zoomRange ? Math.max(zoomRange[0], zoomRange[1]) : null;
+
+    for (const tr of traces) {
+      if (!tr.peakFit) continue;
+      if (
+        zMin === null ||
+        zMax === null ||
+        (tr.peakFit.xPeakCalibrated >= zMin && tr.peakFit.xPeakCalibrated <= zMax)
+      ) {
+        map.set(tr.id, tr.peakFit);
+        continue;
+      }
+      // Global peak is outside zoom range: fit the highest local maximum within the zoomed window
+      let bestIdx = -1;
+      let bestVal = -Infinity;
+      for (let i = 0; i < tr.xs.length; i++) {
+        const x = tr.xs[i];
+        if (x >= zMin && x <= zMax && tr.workingY[i] > bestVal) {
+          bestVal = tr.workingY[i];
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0) {
+        const localFit = buildComputedCurveFit(
+          tr.workingY,
+          tr.xs,
+          bestIdx,
+          tr.isNormalized,
+          tr.scaleMin,
+          tr.scaleSpan,
+        );
+        if (localFit) map.set(tr.id, localFit);
+      } else {
+        map.set(tr.id, tr.peakFit);
+      }
+    }
+    return map;
+  }, [traces, curveFitEnabled, zoomRange]);
+
+  const primaryCurveFit = primaryTrace ? (activeTraceFits.get(primaryTrace.id) ?? null) : null;
 
   const handleToggleAutoOffset = () => {
     if (!isMultiOverlay && samples.length >= 2) {
@@ -620,6 +777,16 @@ export function SpectrumView({
           }
         }
       }
+      if (curveFitEnabled) {
+        const fit = activeTraceFits.get(tr.id);
+        if (fit && fit.xPeakCalibrated >= xMin && fit.xPeakCalibrated <= xMax) {
+          const crestY = fit.yPeakDisplay + yOffset;
+          if (Number.isFinite(crestY)) {
+            if (crestY > yMax) yMax = crestY;
+            if (crestY < yMin) yMin = crestY;
+          }
+        }
+      }
     }
     if (!found) {
       yMin = traces[0].minY;
@@ -636,7 +803,17 @@ export function SpectrumView({
         yMax: yMax + yPad,
       },
     };
-  }, [traces, zoomRange, isMultiOverlay, isAutoOffsetActive, baselineEnabled, smoothEnabled, showFittedBaseline]);
+  }, [
+    traces,
+    zoomRange,
+    isMultiOverlay,
+    isAutoOffsetActive,
+    baselineEnabled,
+    smoothEnabled,
+    showFittedBaseline,
+    curveFitEnabled,
+    activeTraceFits,
+  ]);
 
   const getTraceYOffset = (traceId: string) =>
     isAutoOffsetActive ? (traceYOffsets.get(traceId) ?? 0) : 0;
@@ -712,7 +889,54 @@ export function SpectrumView({
         }
       }
 
-      return { trace: tr, mainD, rawD, baseD, areaD, yOffset };
+      let fitD = '';
+      let fitColor = getCurveFitStrokeColor(tr.color);
+      let fitOverlay: {
+        fit: ComputedCurveFit;
+        markerX: number;
+        apexY: number;
+        color: string;
+        showWindowDots: boolean;
+      } | null = null;
+
+      if (curveFitEnabled) {
+        const computedFit = activeTraceFits.get(tr.id);
+        if (computedFit) {
+          fitColor = getCurveFitStrokeColor(tr.color);
+          if (!computedFit.fit.isFallback && computedFit.samples.length >= 2) {
+            const fitCmds: string[] = [];
+            let started = false;
+            for (let i = 0; i < computedFit.samples.length; i++) {
+              const sp = computedFit.samples[i];
+              if (sp.x < viewDomain.xMin || sp.x > viewDomain.xMax) continue;
+              const sx = mapX(sp.x).toFixed(2);
+              const sy = mapY(sp.y + yOffset).toFixed(2);
+              fitCmds.push(started ? `L${sx},${sy}` : `M${sx},${sy}`);
+              started = true;
+            }
+            fitD = fitCmds.join(' ');
+          }
+
+          if (
+            computedFit.xPeakCalibrated >= viewDomain.xMin &&
+            computedFit.xPeakCalibrated <= viewDomain.xMax
+          ) {
+            const firstWin = computedFit.windowPoints[0];
+            const lastWin = computedFit.windowPoints[computedFit.windowPoints.length - 1];
+            const windowScreenSpan =
+              firstWin && lastWin ? Math.abs(mapX(lastWin.x) - mapX(firstWin.x)) : 0;
+            fitOverlay = {
+              fit: computedFit,
+              markerX: mapX(computedFit.xPeakCalibrated),
+              apexY: mapY(computedFit.yPeakDisplay + yOffset),
+              color: fitColor,
+              showWindowDots: windowScreenSpan >= 24,
+            };
+          }
+        }
+      }
+
+      return { trace: tr, mainD, rawD, baseD, areaD, fitD, fitOverlay, yOffset };
     });
   }, [
     traces,
@@ -723,6 +947,8 @@ export function SpectrumView({
     baselineEnabled,
     smoothEnabled,
     showFittedBaseline,
+    curveFitEnabled,
+    activeTraceFits,
     margin.left,
     margin.top,
     plotW,
@@ -893,10 +1119,9 @@ export function SpectrumView({
       const xLabel = item.trace.symbol
         ? `${item.point.x.toFixed(xDecimals)} ${item.trace.symbol}`
         : item.point.x.toFixed(xDecimals);
-      const yLabel =
-        isMultiOverlay && normalizeOverlay
-          ? `${item.point.y.toFixed(1)}%`
-          : `${item.point.y.toLocaleString(undefined, { maximumFractionDigits: 1 })} cts`;
+      const yLabel = normalizeOverlay
+        ? `${item.point.y.toFixed(1)}%`
+        : `${item.point.y.toLocaleString(undefined, { maximumFractionDigits: 1 })} cts`;
       const maxChars = Math.max(xLabel.length, yLabel.length);
       const boxW = Math.max(76, maxChars * 6.4 + 14);
       const boxH = 30;
@@ -1214,18 +1439,17 @@ export function SpectrumView({
 
   const displayFileName = stripWdfExtension(fileName);
 
-  const yAxisTitle =
-    isMultiOverlay && normalizeOverlay
+  const yAxisTitle = normalizeOverlay
+    ? isAutoOffsetActive
+      ? 'Normalized Intensity (Auto-Offset, %)'
+      : 'Normalized Intensity (%)'
+    : baselineEnabled
       ? isAutoOffsetActive
-        ? 'Normalized Intensity (Auto-Offset, %)'
-        : 'Normalized Intensity (%)'
-      : baselineEnabled
-        ? isAutoOffsetActive
-          ? `Baseline-Corrected Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
-          : `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
-        : isAutoOffsetActive
-          ? `Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
-          : `Intensity (${wdf.header.spectralUnitsName})`;
+        ? `Baseline-Corrected Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
+        : `Baseline-Corrected Intensity (${wdf.header.spectralUnitsName})`
+      : isAutoOffsetActive
+        ? `Intensity (Auto-Offset · ${wdf.header.spectralUnitsName})`
+        : `Intensity (${wdf.header.spectralUnitsName})`;
 
   return (
     <div
@@ -1488,6 +1712,51 @@ export function SpectrumView({
               </label>
             )}
 
+            {/* 5-Point Gaussian Curve Fit Toggle Switch (default ON) */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={curveFitEnabled}
+              onClick={() => setCurveFitEnabled((prev) => !prev)}
+              className={`inline-flex items-center gap-2 px-2.5 py-1 rounded border text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                curveFitEnabled
+                  ? 'bg-orange-50 border-orange-300 text-orange-900 hover:bg-orange-100/80'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+              }`}
+              title="Toggle 5-point Gaussian (log-parabola) sub-pixel peak curve fit overlay"
+            >
+              <span
+                aria-hidden="true"
+                className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+                  curveFitEnabled ? 'bg-orange-600' : 'bg-slate-300'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3 w-3 rounded-full bg-white shadow-xs transition-transform ${
+                    curveFitEnabled ? 'translate-x-3.5' : 'translate-x-0.5'
+                  }`}
+                />
+              </span>
+              <span>Curve Fit</span>
+            </button>
+
+            <label
+              className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap"
+              title={
+                curveFitEnabled
+                  ? 'Normalize discrete data and fitted Gaussian curve relative to fitted peak crest (100%)'
+                  : 'Normalize intensity to 0–100%'
+              }
+            >
+              <input
+                type="checkbox"
+                checked={normalizeOverlay}
+                onChange={(e) => setNormalizeOverlay(e.target.checked)}
+                className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+              />
+              <span>Normalize (%)</span>
+            </label>
+
             <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 select-none cursor-pointer whitespace-nowrap">
               <input
                 type="checkbox"
@@ -1581,16 +1850,68 @@ export function SpectrumView({
                 );
               })}
             </div>
+          </div>
+        )}
 
-            <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer select-none whitespace-nowrap">
-              <input
-                type="checkbox"
-                checked={normalizeOverlay}
-                onChange={(e) => setNormalizeOverlay(e.target.checked)}
-                className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-              />
-              <span>Normalize (0–100%)</span>
-            </label>
+        {/* 5-Point Gaussian Curve Fit Readout Badge */}
+        {curveFitEnabled && primaryCurveFit && (
+          <div
+            data-testid="curve-fit-badge"
+            className="px-3 py-1.5 bg-orange-50/70 border-b border-orange-200/80 flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 text-xs"
+          >
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono tabular-nums text-slate-800">
+              <span className="inline-flex items-center gap-1.5 font-sans font-semibold text-orange-900">
+                <span
+                  className="w-2.5 h-0.5 inline-block rounded-full"
+                  style={{ backgroundColor: getCurveFitStrokeColor(primaryTrace.color) }}
+                  aria-hidden="true"
+                />
+                <span>
+                  {primaryCurveFit.fit.isFallback ? 'Curve Fit (Raw Fallback)' : '5-pt Gaussian Fit'}
+                </span>
+              </span>
+
+              <span title="Fitted sub-pixel peak position in pixels (and calibrated spectral axis)">
+                <span className="text-slate-500 mr-1">x_peak:</span>
+                <strong className="font-semibold text-slate-900">
+                  {primaryCurveFit.fit.xPeak.toFixed(2)} px
+                </strong>
+                <span className="text-slate-500 ml-1.5">
+                  ({primaryCurveFit.xPeakCalibrated.toFixed(effectiveUnit === 'electronVolt' ? 4 : 2)}
+                  {primaryTrace.symbol ? ` ${primaryTrace.symbol}` : ''})
+                </span>
+              </span>
+
+              <span title="Fitted peak intensity at x_peak (crest equals 100% when normalized)">
+                <span className="text-slate-500 mr-1">Peak Intensity:</span>
+                <strong className="font-semibold text-slate-900">
+                  {normalizeOverlay
+                    ? `${primaryCurveFit.yPeakDisplay.toFixed(1)}%`
+                    : `${primaryCurveFit.yPeakDisplay.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${wdf.header.spectralUnitsName.toLowerCase()}`}
+                </strong>
+              </span>
+
+              <span title="Full Width at Half Maximum in detector pixels">
+                <span className="text-slate-500 mr-1">FWHM:</span>
+                <strong className="font-semibold text-orange-800">
+                  {primaryCurveFit.fit.fwhm !== null
+                    ? `${primaryCurveFit.fit.fwhm.toFixed(2)} px`
+                    : '—'}
+                </strong>
+              </span>
+            </div>
+
+            {primaryCurveFit.zoomMaxX > primaryCurveFit.zoomMinX && (
+              <button
+                type="button"
+                onClick={() => setZoomRange([primaryCurveFit.zoomMinX, primaryCurveFit.zoomMaxX])}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-orange-300 bg-white/90 hover:bg-orange-100/70 text-[11px] font-sans font-medium text-orange-900 cursor-pointer whitespace-nowrap transition-colors"
+                title="Zoom X-axis onto the fitted peak region to inspect sub-pixel Gaussian alignment"
+              >
+                <ZoomIn className="w-3 h-3" aria-hidden="true" />
+                <span>Zoom to Fit</span>
+              </button>
+            )}
           </div>
         )}
 
@@ -1612,7 +1933,7 @@ export function SpectrumView({
                     {baselineEnabled ? 'Corrected:' : 'Intensity:'}
                   </span>
                   <strong className="font-semibold text-slate-900">
-                    {isMultiOverlay && normalizeOverlay
+                    {normalizeOverlay
                       ? `${hoverPickCandidate.point.y.toFixed(1)}%`
                       : `${hoverPickCandidate.point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${wdf.header.spectralUnitsName.toLowerCase()}`}
                   </strong>
@@ -1664,8 +1985,9 @@ export function SpectrumView({
                       {baselineEnabled ? 'Corrected:' : smoothEnabled ? 'Smoothed:' : 'Intensity:'}
                     </span>
                     <strong className="font-semibold text-slate-900">
-                      {hoveredMatches[0].point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })}{' '}
-                      {wdf.header.spectralUnitsName.toLowerCase()}
+                      {normalizeOverlay
+                        ? `${hoveredMatches[0].point.y.toFixed(1)}%`
+                        : `${hoveredMatches[0].point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${wdf.header.spectralUnitsName.toLowerCase()}`}
                     </strong>
                   </span>
                   {smoothEnabled && !baselineEnabled && (
@@ -2023,7 +2345,7 @@ export function SpectrumView({
                   })}
 
                 {/* Traces */}
-                {tracePaths.map(({ trace, mainD, rawD, baseD, areaD }) => (
+                {tracePaths.map(({ trace, mainD, rawD, baseD, areaD, fitD, fitOverlay, yOffset }) => (
                   <g key={trace.id} data-trace-id={trace.id}>
                     {rawD && (
                       <path
@@ -2055,6 +2377,85 @@ export function SpectrumView({
                         strokeLinejoin="round"
                         strokeLinecap="round"
                       />
+                    )}
+
+                    {/* 5-Point Gaussian Curve Fit Overlay & Sub-Pixel Peak Marker */}
+                    {curveFitEnabled && fitOverlay && (
+                      <g data-curve-fit-group={trace.id}>
+                        <title>
+                          {`5-pt Gaussian Fit (${trace.fileName}): x_peak = ${fitOverlay.fit.fit.xPeak.toFixed(2)} px (${fitOverlay.fit.xPeakCalibrated.toFixed(2)}${trace.symbol ? ` ${trace.symbol}` : ''}), Intensity = ${
+                            normalizeOverlay
+                              ? `${fitOverlay.fit.yPeakDisplay.toFixed(1)}%`
+                              : fitOverlay.fit.yPeakDisplay.toLocaleString(undefined, { maximumFractionDigits: 1 })
+                          }, FWHM = ${
+                            fitOverlay.fit.fit.fwhm !== null
+                              ? `${fitOverlay.fit.fit.fwhm.toFixed(2)} px`
+                              : 'fallback'
+                          }`}
+                        </title>
+
+                        {/* Vertical dashed peak center marker at xPeak */}
+                        <line
+                          data-curve-fit-marker={trace.id}
+                          x1={fitOverlay.markerX}
+                          y1={margin.top}
+                          x2={fitOverlay.markerX}
+                          y2={margin.top + plotH}
+                          stroke={fitOverlay.color}
+                          strokeWidth="1.25"
+                          strokeOpacity="0.78"
+                          strokeDasharray="4 3"
+                          pointerEvents="none"
+                        />
+
+                        {/* Discrete 5-pixel sample dots when zoomed close enough to distinguish pixels */}
+                        {fitOverlay.showWindowDots &&
+                          fitOverlay.fit.windowPoints.map((wp) => (
+                            <circle
+                              key={`fit-px-${wp.pixel}`}
+                              cx={mapX(wp.x)}
+                              cy={mapY(wp.y + yOffset)}
+                              r="3"
+                              fill="#FFFFFF"
+                              stroke={trace.color}
+                              strokeWidth="1.5"
+                              pointerEvents="none"
+                            />
+                          ))}
+
+                        {/* Smooth 0.05-pixel sampled Gaussian curve across [peakIndex - 3 .. peakIndex + 3] */}
+                        {fitD && (
+                          <path
+                            data-curve-fit-path={trace.id}
+                            d={fitD}
+                            fill="none"
+                            stroke={fitOverlay.color}
+                            strokeWidth="2.2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            pointerEvents="none"
+                          />
+                        )}
+
+                        {/* Sub-pixel peak crest crosshair marker at (xPeak, yPeak) */}
+                        <line
+                          x1={fitOverlay.markerX - 6}
+                          y1={fitOverlay.apexY}
+                          x2={fitOverlay.markerX + 6}
+                          y2={fitOverlay.apexY}
+                          stroke={fitOverlay.color}
+                          strokeWidth="1.5"
+                          pointerEvents="none"
+                        />
+                        <circle
+                          cx={fitOverlay.markerX}
+                          cy={fitOverlay.apexY}
+                          r="3.5"
+                          fill={fitOverlay.color}
+                          stroke="#FFFFFF"
+                          strokeWidth="1.4"
+                        />
+                      </g>
                     )}
                   </g>
                 ))}
@@ -2437,13 +2838,13 @@ export function SpectrumView({
                     Peak Intensity
                   </div>
                   <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
-                    {isMultiOverlay && normalizeOverlay
+                    {normalizeOverlay
                       ? `${activeStats.peakY.toFixed(1)}%`
                       : activeStats.peakY.toLocaleString(undefined, { maximumFractionDigits: 1 })}
                   </div>
                   <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
                     Range:{' '}
-                    {isMultiOverlay && normalizeOverlay
+                    {normalizeOverlay
                       ? `${activeStats.dynamicRange.toFixed(1)}%`
                       : activeStats.dynamicRange.toLocaleString(undefined, { maximumFractionDigits: 1 })}
                   </div>
@@ -2469,10 +2870,10 @@ export function SpectrumView({
                   <div className="mt-1 text-sm font-mono font-semibold tabular-nums text-slate-900">
                     {(() => {
                       const fmt = (v: number) => {
-                        const s = v.toFixed(isMultiOverlay && normalizeOverlay ? 1 : 1);
+                        const s = v.toFixed(1);
                         return s === '-0.0' ? '0.0' : s;
                       };
-                      const suffix = isMultiOverlay && normalizeOverlay ? '%' : '';
+                      const suffix = normalizeOverlay ? '%' : '';
                       return `${fmt(activeStats.baselineFloor)}${suffix} / ${fmt(activeStats.meanY)}${suffix}`;
                     })()}
                   </div>
@@ -2531,7 +2932,7 @@ export function SpectrumView({
                       {isMultiOverlay && <th className="py-2 px-4 font-medium">Sample</th>}
                       <th className="py-2 px-4 font-medium">Position ({primaryTrace.symbol || 'X'})</th>
                       <th className="py-2 px-4 font-medium text-right">
-                        {isMultiOverlay && normalizeOverlay
+                        {normalizeOverlay
                           ? 'Intensity (%)'
                           : `Intensity (${wdf.header.spectralUnitsName})`}
                       </th>
@@ -2558,7 +2959,7 @@ export function SpectrumView({
                           {point.x.toFixed(effectiveUnit === 'electronVolt' ? 4 : 2)}
                         </td>
                         <td className="py-2 px-4 text-right text-slate-900">
-                          {isMultiOverlay && normalizeOverlay
+                          {normalizeOverlay
                             ? `${point.y.toFixed(1)}%`
                             : point.y.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                         </td>
@@ -2608,7 +3009,7 @@ export function SpectrumView({
                       FWHM ({primaryTrace.symbol || 'X'})
                     </th>
                     <th className="py-2 px-4 font-medium text-right">
-                      {isMultiOverlay && normalizeOverlay
+                      {normalizeOverlay
                         ? 'Intensity (%)'
                         : `Intensity (${wdf.header.spectralUnitsName})`}
                     </th>
@@ -2638,7 +3039,7 @@ export function SpectrumView({
                           : '—'}
                       </td>
                       <td className="py-2 px-4 text-right text-slate-800">
-                        {isMultiOverlay && normalizeOverlay
+                        {normalizeOverlay
                           ? `${pk.intensity.toFixed(1)}%`
                           : pk.intensity.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </td>
