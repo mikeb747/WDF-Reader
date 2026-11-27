@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, FolderOpen, Upload, X } from 'lucide-react';
+import { AlertCircle, FolderOpen, Loader2, Upload, X } from 'lucide-react';
 import { BlockMapView } from './components/BlockMapView';
 import { InstrumentView } from './components/InstrumentView';
 import { OfflineIndicator } from './components/PWAInstallButton';
@@ -66,6 +66,28 @@ const BUNDLED_REGISTRIES: Array<{ id: string; fileName: string; url: string }> =
 interface IncomingFile {
   file: File;
   folderName: string | null;
+}
+
+interface IngestionProgress {
+  phase: 'scanning' | 'processing' | 'finalizing';
+  processed: number;
+  total: number;
+  currentFile: string;
+  spectraCount: number;
+  registryCount: number;
+  skippedCount: number;
+}
+
+function yieldToPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => {
+        window.setTimeout(resolve, 0);
+      });
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
 }
 
 function triggerDownload(content: string, fileName: string, mimeType: string) {
@@ -206,6 +228,21 @@ function hasRegistryHeaderSignature(bytes: Uint8Array): boolean {
       chars.push(String.fromCharCode(slice[i] | (slice[i + 1] << 8)));
     }
     prefixText = chars.join('');
+  } else if (
+    slice.length >= 10 &&
+    slice[0] === 0xef &&
+    slice[1] === 0xbf &&
+    slice[2] === 0xbd &&
+    slice[3] === 0xef &&
+    slice[4] === 0xbf &&
+    slice[5] === 0xbd
+  ) {
+    // UTF-16LE whose FF FE BOM was replaced with two UTF-8 U+FFFD sequences
+    const chars: string[] = [];
+    for (let i = 6; i + 1 < slice.length; i += 2) {
+      chars.push(String.fromCharCode(slice[i] | (slice[i + 1] << 8)));
+    }
+    prefixText = chars.join('');
   } else if (slice[0] === 0xfe && slice[1] === 0xff) {
     // UTF-16BE with BOM
     const chars: string[] = [];
@@ -255,6 +292,7 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoadingSamples, setIsLoadingSamples] = useState(!IS_PWA_BUILD);
+  const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const registryFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -343,11 +381,15 @@ export default function App() {
 
   const ingestFiles = useCallback(
     async (incoming: IncomingFile[], isDirectoryBatch = false, forceRegistryMode = false) => {
-      if (incoming.length === 0) return;
+      if (incoming.length === 0) {
+        setIngestionProgress(null);
+        return;
+      }
       setErrorMessage(null);
       const newlyLoaded: LoadedSample[] = [];
       const newlyLoadedRegistries: LoadedRegistryFile[] = [];
       const errors: string[] = [];
+      let skippedCount = 0;
 
       // Sort by folder path, then file name for predictable folder grouping
       const ordered = [...incoming].sort((a, b) => {
@@ -356,109 +398,175 @@ export default function App() {
         return a.file.name.localeCompare(b.file.name);
       });
 
-      for (const { file, folderName } of ordered) {
-        if (file.name.startsWith('.')) continue;
-        try {
-          // Always read raw binary bytes via file.arrayBuffer() so UTF-16LE/BE BOMs and WDF1 binaries stay intact
-          const buf = await file.arrayBuffer();
-          const bytes = new Uint8Array(buf);
-          const isWdf = hasWdf1Magic(bytes);
-          const isReg =
-            forceRegistryMode ||
-            isRegistryFileName(file.name) ||
-            (!isWdf && hasRegistryHeaderSignature(bytes));
+      const totalFiles = ordered.length;
+      setIngestionProgress({
+        phase: 'processing',
+        processed: 0,
+        total: totalFiles,
+        currentFile: ordered[0]?.file.name ?? '',
+        spectraCount: 0,
+        registryCount: 0,
+        skippedCount: 0,
+      });
+      // Allow browser to paint the loading overlay immediately before heavy parsing begins
+      await yieldToPaint();
 
-          if (isReg && !isWdf) {
-            const { parsed, summary } = parseRegistryBytes(bytes, file.name);
-            const resolvedFolder = isDirectoryBatch
-              ? folderName || 'Imported Folder'
-              : null;
-            newlyLoadedRegistries.push({
-              id: `reg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-              fileName: file.name,
-              folderName: resolvedFolder,
-              sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded registry',
-              bytes,
-              parsed,
-              summary,
-            });
-            continue;
-          }
+      let lastYieldTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-          // In directory mode, quietly skip non-WDF and non-registry auxiliary files
-          if (isDirectoryBatch && !isWdf) {
-            if (file.name.toLowerCase().endsWith('.wdf')) {
-              errors.push(`${stripWdfExtension(file.name)}: Invalid WDF1 header signature`);
+      try {
+        for (let i = 0; i < ordered.length; i++) {
+          const { file, folderName } = ordered[i];
+          const displayPath = folderName ? `${folderName}/${file.name}` : file.name;
+
+          if (file.name.startsWith('.')) {
+            skippedCount += 1;
+          } else {
+            try {
+              let bytes: Uint8Array | null = null;
+              let isWdf = false;
+              let isReg = forceRegistryMode || isRegistryFileName(file.name);
+
+              // In folder batches, sniff only the first 128 bytes first so unrelated large files
+              // (PDFs, images, archives, logs) are skipped rapidly without reading full buffers.
+              if (isDirectoryBatch && !isReg && !file.name.toLowerCase().endsWith('.wdf')) {
+                const headBuf = await file.slice(0, 128).arrayBuffer();
+                const headBytes = new Uint8Array(headBuf);
+                isWdf = hasWdf1Magic(headBytes);
+                isReg = !isWdf && hasRegistryHeaderSignature(headBytes);
+                if (!isWdf && !isReg) {
+                  skippedCount += 1;
+                } else {
+                  bytes = new Uint8Array(await file.arrayBuffer());
+                }
+              } else {
+                // Always read raw binary bytes via file.arrayBuffer() so UTF-16LE/BE BOMs and WDF1 binaries stay intact
+                bytes = new Uint8Array(await file.arrayBuffer());
+                isWdf = hasWdf1Magic(bytes);
+                isReg = isReg || (!isWdf && hasRegistryHeaderSignature(bytes));
+              }
+
+              if (bytes) {
+                if (isReg && !isWdf) {
+                  const { parsed, summary } = parseRegistryBytes(bytes, file.name);
+                  const resolvedFolder = isDirectoryBatch
+                    ? folderName || 'Imported Folder'
+                    : null;
+                  newlyLoadedRegistries.push({
+                    id: `reg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                    fileName: file.name,
+                    folderName: resolvedFolder,
+                    sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded registry',
+                    bytes,
+                    parsed,
+                    summary,
+                  });
+                } else if (isDirectoryBatch && !isWdf) {
+                  if (file.name.toLowerCase().endsWith('.wdf')) {
+                    errors.push(`${stripWdfExtension(file.name)}: Invalid WDF1 header signature`);
+                  }
+                  skippedCount += 1;
+                } else {
+                  const wdf = parseWdf(bytes);
+                  const resolvedFolder = isDirectoryBatch
+                    ? folderName || 'Imported Folder'
+                    : null;
+
+                  newlyLoaded.push({
+                    id: `upload-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                    fileName: file.name,
+                    folderName: resolvedFolder,
+                    sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded',
+                    bytes,
+                    wdf,
+                    // Folder-loaded files start unchecked inside collapsed folders; user ticks the folder or files to view
+                    visible: !isDirectoryBatch,
+                    color: allocateColor(),
+                  });
+                }
+              }
+            } catch (err) {
+              errors.push(
+                `${stripWdfExtension(file.name)}: ${err instanceof Error ? err.message : 'Unable to parse file'}`,
+              );
             }
-            continue;
           }
 
-          const wdf = parseWdf(bytes);
-          const resolvedFolder = isDirectoryBatch
-            ? folderName || 'Imported Folder'
-            : null;
+          const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          if (i === ordered.length - 1 || now - lastYieldTime >= 32) {
+            setIngestionProgress({
+              phase: 'processing',
+              processed: i + 1,
+              total: totalFiles,
+              currentFile: displayPath,
+              spectraCount: newlyLoaded.length,
+              registryCount: newlyLoadedRegistries.length,
+              skippedCount,
+            });
+            await yieldToPaint();
+            lastYieldTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          }
+        }
 
-          newlyLoaded.push({
-            id: `upload-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            fileName: file.name,
-            folderName: resolvedFolder,
-            sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded',
-            bytes,
-            wdf,
-            // Folder-loaded files start unchecked inside collapsed folders; user ticks the folder or files to view
-            visible: !isDirectoryBatch,
-            color: allocateColor(),
+        setIngestionProgress({
+          phase: 'finalizing',
+          processed: totalFiles,
+          total: totalFiles,
+          currentFile: 'Preparing Explorer and views…',
+          spectraCount: newlyLoaded.length,
+          registryCount: newlyLoadedRegistries.length,
+          skippedCount,
+        });
+
+        if (newlyLoaded.length > 0) {
+          setSamples((prev) => {
+            if (!isDirectoryBatch && newlyLoaded.length === 1 && prev.filter((s) => s.visible).length <= 1) {
+              return [
+                ...newlyLoaded,
+                ...prev.map((s) => ({ ...s, visible: false })),
+              ];
+            }
+            if (isDirectoryBatch) {
+              return [...prev, ...newlyLoaded];
+            }
+            return [...newlyLoaded, ...prev];
           });
-        } catch (err) {
-          errors.push(
-            `${stripWdfExtension(file.name)}: ${err instanceof Error ? err.message : 'Unable to parse file'}`,
+          setSelectedId((prevSelected) => prevSelected ?? newlyLoaded[0].id);
+          if (!isDirectoryBatch) {
+            setSelectedId(newlyLoaded[0].id);
+            setExplorerSelectionKind('wdf');
+          }
+        }
+
+        if (newlyLoadedRegistries.length > 0) {
+          setRegistryFiles((prev) =>
+            isDirectoryBatch ? [...prev, ...newlyLoadedRegistries] : [...newlyLoadedRegistries, ...prev],
+          );
+          setSelectedRegistryId((prevSelected) =>
+            !isDirectoryBatch || !prevSelected ? newlyLoadedRegistries[0].id : prevSelected,
+          );
+          if (!isDirectoryBatch && newlyLoaded.length === 0) {
+            setSelectedRegistryId(newlyLoadedRegistries[0].id);
+            setExplorerSelectionKind('registry');
+            setActiveTab('registry');
+            setIsFullscreen(false);
+          }
+        }
+
+        if (newlyLoaded.length === 0 && newlyLoadedRegistries.length === 0 && isDirectoryBatch && errors.length === 0) {
+          setErrorMessage(
+            'No valid Renishaw .wdf spectra or registry (.reg, .rrg) files were found in the selected folder.',
           );
         }
-      }
 
-      if (newlyLoaded.length > 0) {
-        setSamples((prev) => {
-          if (!isDirectoryBatch && newlyLoaded.length === 1 && prev.filter((s) => s.visible).length <= 1) {
-            return [
-              ...newlyLoaded,
-              ...prev.map((s) => ({ ...s, visible: false })),
-            ];
-          }
-          if (isDirectoryBatch) {
-            return [...prev, ...newlyLoaded];
-          }
-          return [...newlyLoaded, ...prev];
-        });
-        setSelectedId((prevSelected) => prevSelected ?? newlyLoaded[0].id);
-        if (!isDirectoryBatch) {
-          setSelectedId(newlyLoaded[0].id);
-          setExplorerSelectionKind('wdf');
+        if (errors.length > 0) {
+          setErrorMessage(errors.slice(0, 4).join(' · '));
         }
-      }
 
-      if (newlyLoadedRegistries.length > 0) {
-        setRegistryFiles((prev) =>
-          isDirectoryBatch ? [...prev, ...newlyLoadedRegistries] : [...newlyLoadedRegistries, ...prev],
-        );
-        setSelectedRegistryId((prevSelected) =>
-          !isDirectoryBatch || !prevSelected ? newlyLoadedRegistries[0].id : prevSelected,
-        );
-        if (!isDirectoryBatch && newlyLoaded.length === 0) {
-          setSelectedRegistryId(newlyLoadedRegistries[0].id);
-          setExplorerSelectionKind('registry');
-          setActiveTab('registry');
-          setIsFullscreen(false);
-        }
-      }
-
-      if (newlyLoaded.length === 0 && newlyLoadedRegistries.length === 0 && isDirectoryBatch && errors.length === 0) {
-        setErrorMessage(
-          'No valid Renishaw .wdf spectra or registry (.reg, .rrg) files were found in the selected folder.',
-        );
-      }
-
-      if (errors.length > 0) {
-        setErrorMessage(errors.slice(0, 4).join(' · '));
+        // Wait for React to commit and paint the updated Explorer & views before dismissing the overlay
+        await yieldToPaint();
+        await yieldToPaint();
+      } finally {
+        setIngestionProgress(null);
       }
     },
     [allocateColor],
@@ -672,9 +780,26 @@ export default function App() {
       onDrop={(e) => {
         e.preventDefault();
         setIsDraggingFile(false);
+        const dt = e.dataTransfer;
+        setIngestionProgress({
+          phase: 'scanning',
+          processed: 0,
+          total: 0,
+          currentFile: 'Scanning dropped files and subfolders…',
+          spectraCount: 0,
+          registryCount: 0,
+          skippedCount: 0,
+        });
         void (async () => {
-          const { files, fromDirectory } = await extractFilesFromDataTransfer(e.dataTransfer);
-          await ingestFiles(files, fromDirectory);
+          try {
+            const { files, fromDirectory } = await extractFilesFromDataTransfer(dt);
+            await ingestFiles(files, fromDirectory);
+          } catch (err) {
+            setIngestionProgress(null);
+            setErrorMessage(
+              err instanceof Error ? err.message : 'Unable to read dropped files or folder.',
+            );
+          }
         })();
       }}
     >
@@ -873,6 +998,98 @@ export default function App() {
         </main>
       </div>
       <OfflineIndicator />
+
+      {/* Full-viewport Loading & Analysis Overlay while files/folders are being parsed */}
+      {ingestionProgress && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+          data-testid="ingestion-loading-overlay"
+          className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-[2px] flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-md bg-white border border-slate-200 rounded-md shadow-xl overflow-hidden">
+            <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center gap-2.5">
+              <Loader2 className="w-4 h-4 text-blue-600 animate-spin shrink-0" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <h2 className="text-xs font-semibold text-slate-900 uppercase tracking-wider">
+                  {ingestionProgress.phase === 'scanning'
+                    ? 'Scanning Folder Contents'
+                    : ingestionProgress.phase === 'finalizing'
+                      ? 'Preparing Workspace'
+                      : 'Loading & Analysing Files'}
+                </h2>
+              </div>
+              {ingestionProgress.total > 0 && (
+                <span className="text-xs font-mono font-semibold tabular-nums text-blue-700 shrink-0">
+                  {Math.round((ingestionProgress.processed / ingestionProgress.total) * 100)}%
+                </span>
+              )}
+            </div>
+
+            <div className="p-4 space-y-3">
+              <div className="flex items-center justify-between gap-2 text-xs font-mono tabular-nums">
+                <span className="text-slate-700 font-medium">
+                  {ingestionProgress.total > 0
+                    ? `${ingestionProgress.processed.toLocaleString()} / ${ingestionProgress.total.toLocaleString()} files`
+                    : 'Discovering subfolders…'}
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  {ingestionProgress.phase === 'finalizing' ? 'Almost ready' : 'Please wait'}
+                </span>
+              </div>
+
+              <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden border border-slate-200/80">
+                {ingestionProgress.total > 0 ? (
+                  <div
+                    className="h-full bg-blue-600 transition-[width] duration-150 ease-out"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.max(2, (ingestionProgress.processed / ingestionProgress.total) * 100),
+                      ).toFixed(1)}%`,
+                    }}
+                  />
+                ) : (
+                  <div className="h-full w-1/3 bg-blue-600 animate-pulse rounded-full" />
+                )}
+              </div>
+
+              <div
+                className="text-[11px] font-mono text-slate-600 bg-slate-50 border border-slate-200/80 rounded px-2.5 py-1.5 truncate"
+                title={ingestionProgress.currentFile}
+              >
+                {ingestionProgress.currentFile || 'Reading files…'}
+              </div>
+
+              {ingestionProgress.total > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] font-mono tabular-nums text-slate-500">
+                  <span>
+                    Spectra:{' '}
+                    <span className="font-semibold text-slate-800">
+                      {ingestionProgress.spectraCount}
+                    </span>
+                  </span>
+                  <span>
+                    Registries:{' '}
+                    <span className="font-semibold text-slate-800">
+                      {ingestionProgress.registryCount}
+                    </span>
+                  </span>
+                  {ingestionProgress.skippedCount > 0 && (
+                    <span>
+                      Other skipped:{' '}
+                      <span className="font-semibold text-slate-700">
+                        {ingestionProgress.skippedCount}
+                      </span>
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

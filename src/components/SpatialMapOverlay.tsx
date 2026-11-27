@@ -124,7 +124,7 @@ export function SpatialMapOverlay({
   const [opticalVisible, setOpticalVisible] = useState<boolean>(true);
   const [opticalOpacity, setOpticalOpacity] = useState<number>(100);
   const [ramanVisible, setRamanVisible] = useState<boolean>(true);
-  const [ramanOpacity, setRamanOpacity] = useState<number>(hasWhiteLight ? 68 : 100);
+  const [ramanOpacity, setRamanOpacity] = useState<number>(hasWhiteLight ? 35 : 100);
 
   // Rendering & framing options
   const [colormap, setColormap] = useState<MapColormapId>('inferno');
@@ -147,7 +147,7 @@ export function SpatialMapOverlay({
     setOpticalVisible(true);
     setOpticalOpacity(100);
     setRamanVisible(true);
-    setRamanOpacity(Boolean(whiteLightUrl && wdf.whiteLightImage) ? 68 : 100);
+    setRamanOpacity(Boolean(whiteLightUrl && wdf.whiteLightImage) ? 35 : 100);
     setFramingMode('fit-map');
     setZoomFactor(1);
     setHoverCell(null);

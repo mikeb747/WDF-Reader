@@ -14,6 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import { stripWdfExtension } from '../lib/format';
+import { findMostRecentRrgIds } from '../lib/registryBackup';
 import type { WdfFile } from '../lib/wdf';
 import type { ParsedRegistry, RegistryAnalysisSummary } from '../registry';
 import { TRACE_COLOR_PALETTE, TraceColorPicker } from './TraceColorPicker';
@@ -240,6 +241,9 @@ export function Sidebar({
       })),
     };
   }, [samples, registryFiles]);
+
+  // Identify the most recent dated .rrg backup (<Serial>_YYYYMMDD_sys.rrg / _use.rrg) per folder
+  const mostRecentRrgMap = useMemo(() => findMostRecentRrgIds(registryFiles), [registryFiles]);
 
   // Visual top-to-bottom order of currently displayed WDF rows for Shift+Click range selection
   const orderedVisibleFileIds = useMemo(() => {
@@ -583,27 +587,42 @@ export function Sidebar({
     const isSelected = activeSelectionKind === 'registry' && reg.id === selectedRegistryId;
     const extMatch = reg.fileName.match(/\.(reg|rrg)$/i);
     const extLabel = extMatch ? extMatch[1].toUpperCase() : 'REG';
+    const mostRecentInfo = mostRecentRrgMap.get(reg.id) ?? null;
+    const isMostRecentRrg = mostRecentInfo !== null;
+    const rowTitle = mostRecentInfo
+      ? `${reg.fileName} — Most recent ${mostRecentInfo.kind === 'other' ? 'registry' : mostRecentInfo.kind} backup (${mostRecentInfo.dateFormatted})`
+      : reg.fileName;
+
     return (
       <div
         key={reg.id}
         role="option"
         data-explorer-registry-id={reg.id}
+        data-most-recent-rrg={isMostRecentRrg ? 'true' : undefined}
         aria-selected={isSelected}
         onClick={() => {
           setMultiSelectedIds([]);
           onSelectRegistryFile(reg.id);
         }}
         className={`w-full text-left px-2 py-1 rounded border transition-colors cursor-pointer select-none group/row ${
-          isSelected
-            ? 'bg-blue-50/70 border-blue-600 text-slate-900'
-            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+          isMostRecentRrg
+            ? isSelected
+              ? 'bg-emerald-100/80 border-blue-600 text-slate-900'
+              : 'bg-emerald-50 border-emerald-300 text-slate-800 hover:bg-emerald-100/70 hover:border-emerald-400'
+            : isSelected
+              ? 'bg-blue-50/70 border-blue-600 text-slate-900'
+              : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
         }`}
       >
         <div className="flex items-center justify-between gap-1.5">
           <div className="flex items-center gap-2 min-w-0 flex-1">
             <FileCode2
               className={`w-3.5 h-3.5 shrink-0 ${
-                isSelected ? 'text-blue-600' : 'text-slate-500'
+                isSelected
+                  ? 'text-blue-600'
+                  : isMostRecentRrg
+                    ? 'text-emerald-600'
+                    : 'text-slate-500'
               }`}
               aria-hidden="true"
             />
@@ -611,14 +630,20 @@ export function Sidebar({
               className={`text-xs leading-5 truncate ${
                 isSelected ? 'font-semibold text-slate-900' : 'font-medium text-slate-800'
               }`}
-              title={reg.fileName}
+              title={rowTitle}
             >
               {reg.fileName}
             </span>
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
-            <span className="font-mono text-[10px] font-medium text-slate-500 border border-slate-200 bg-slate-50 px-1 rounded-xs">
+            <span
+              className={`font-mono text-[10px] font-medium border px-1 rounded-xs ${
+                isMostRecentRrg
+                  ? 'text-emerald-800 border-emerald-300 bg-emerald-100/80'
+                  : 'text-slate-500 border-slate-200 bg-slate-50'
+              }`}
+            >
               {extLabel}
             </span>
             <button
