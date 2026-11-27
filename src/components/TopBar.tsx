@@ -1,6 +1,6 @@
 import { PWAInstallButton } from './PWAInstallButton';
 
-export type ActiveTab = 'spectrum' | 'instrument' | 'blocks' | 'export';
+export type ActiveTab = 'spectrum' | 'instrument' | 'registry' | 'blocks' | 'export';
 
 interface TopBarProps {
   activeTab: ActiveTab;
@@ -11,6 +11,7 @@ interface TopBarProps {
 const ALL_NAV_ITEMS: Array<{ id: ActiveTab; label: string; demoOnly?: boolean }> = [
   { id: 'spectrum', label: 'Spectrum' },
   { id: 'instrument', label: 'Instrument' },
+  { id: 'registry', label: 'Registry' },
   { id: 'blocks', label: 'Block Map', demoOnly: true },
   { id: 'export', label: 'TypeScript Export', demoOnly: true },
 ];
@@ -26,10 +27,10 @@ export function TopBar({ activeTab, onSelectTab, isPwaBuild = false }: TopBarPro
         {/* Zone 1: Brand Wordmark */}
         <div className="flex items-baseline gap-2.5 min-w-0 shrink-0">
           <span className="text-[15px] font-semibold tracking-tight text-slate-900 whitespace-nowrap">
-            WDF Reader
+            WiRE Reader
           </span>
           <span className="hidden sm:inline text-xs text-slate-500 whitespace-nowrap">
-            Renishaw WiRE Binary Parser
+            Renishaw WiRE Parser
           </span>
         </div>
 

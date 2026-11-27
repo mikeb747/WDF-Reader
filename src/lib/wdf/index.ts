@@ -31,9 +31,17 @@ export {
   type AutoSmoothResult,
 } from './smoothing';
 export {
+  fitPeakCurve,
   fitGaussianPeak,
+  estimatePeakWidthAndBaseline,
+  samplePeakCurve,
   sampleGaussianPeakCurve,
   interpolateAxisAtPixel,
+  CURVE_FIT_MODEL_NAMES,
+  type CurveFitMethod,
+  type ResolvedCurveFitModel,
+  type CurveFitResult,
   type GaussianPeakFit,
+  type PeakWidthBaselineEstimate,
   type SampledCurvePoint,
 } from './curveFit';

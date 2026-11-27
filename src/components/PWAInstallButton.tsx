@@ -24,7 +24,7 @@ export function PWAInstallButton() {
         type="button"
         onClick={() => void handleClick()}
         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 hover:border-slate-400 text-slate-800 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-        title="Install WDF Reader as an offline-ready desktop or mobile Progressive Web App"
+        title="Install WiRE Reader as an offline-ready desktop or mobile Progressive Web App"
       >
         <MonitorDown className="w-3.5 h-3.5 text-blue-600 shrink-0" aria-hidden="true" />
         <span>{isIOS ? 'Install App' : 'Install Desktop'}</span>
@@ -40,7 +40,7 @@ export function PWAInstallButton() {
           <div className="w-full max-w-md rounded border border-slate-200 bg-white p-5 shadow-xl space-y-3">
             <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
               <h3 id="pwa-install-title" className="text-sm font-semibold text-slate-900">
-                Install WDF Reader as a Progressive Web App
+                Install WiRE Reader as a Progressive Web App
               </h3>
               <button
                 type="button"
@@ -64,14 +64,14 @@ export function PWAInstallButton() {
             ) : (
               <div className="space-y-2 text-xs text-slate-700">
                 <p>
-                  WDF Reader is configured with a Web App Manifest and Workbox offline service worker:
+                  WiRE Reader is configured with a Web App Manifest and Workbox offline service worker:
                 </p>
                 <ol className="list-decimal list-inside space-y-1.5 text-slate-600">
                   <li>
                     If viewing inside an embedded preview frame, open the standalone app URL or deployed GitHub Pages URL in a top-level browser tab.
                   </li>
                   <li>
-                    Click the <strong>Install WDF Reader</strong> icon in the browser address bar (Chrome / Edge) or choose <strong>File → Add to Dock</strong> (macOS Safari).
+                    Click the <strong>Install WiRE Reader</strong> icon in the browser address bar (Chrome / Edge) or choose <strong>File → Add to Dock</strong> (macOS Safari).
                   </li>
                 </ol>
               </div>

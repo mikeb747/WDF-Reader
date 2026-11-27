@@ -25,8 +25,8 @@ export default defineConfig(() => {
         ],
         manifest: {
           id: base,
-          name: 'WDF Reader — Renishaw Raman Parser',
-          short_name: 'WDF Reader',
+          name: 'WiRE Reader — Renishaw WiRE Parser',
+          short_name: 'WiRE Reader',
           description:
             'Zero-dependency offline-capable viewer and analyzer for Renishaw WiRE (.wdf) Raman spectroscopy files.',
           theme_color: '#0F172A',

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { evaluateVirsaRules, parseRegistry, summarizeRegistry } from '../src/registry';
+import { evaluateVirsaRules, parseRegistry, summarizeRegistry } from './index';
 
 function readAttachmentBytes(relativePath: string): Uint8Array {
   const filePath = path.resolve(process.cwd(), relativePath);

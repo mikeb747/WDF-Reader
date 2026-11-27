@@ -1,4 +1,4 @@
-name: Build & Deploy WDF Reader PWA to GitHub Pages
+name: Build & Deploy WiRE-Reader PWA to GitHub Pages
 
 on:
   push:
@@ -36,8 +36,8 @@ jobs:
             npm install --no-audit --no-fund --legacy-peer-deps
           fi
 
-      - name: Run WDF binary parser unit tests
-        run: npx tsx --test src/lib/wdf/parser.test.ts
+      - name: Run WiRE-Reader WDF, curve-fit & registry unit tests
+        run: npx tsx --test src/lib/wdf/parser.test.ts src/lib/wdf/curveFit.test.ts src/registry/registry.test.ts src/registry/real-virsa-file.test.ts
 
       - name: Build production PWA bundle (dist/ + sw.js + manifest.webmanifest)
         env:
@@ -64,7 +64,7 @@ jobs:
       - name: Attach downloadable PWA dist zip to workflow run
         uses: actions/upload-artifact@v4
         with:
-          name: wdf-reader-pwa-dist
+          name: wire-reader-pwa-dist
           path: ./dist
           retention-days: 30
 

@@ -4,6 +4,7 @@ import {
   ChevronRight,
   Eye,
   EyeOff,
+  FileCode2,
   Folder,
   FolderOpen,
   GripHorizontal,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react';
 import { stripWdfExtension } from '../lib/format';
 import type { WdfFile } from '../lib/wdf';
+import type { ParsedRegistry, RegistryAnalysisSummary } from '../registry';
 import { TRACE_COLOR_PALETTE, TraceColorPicker } from './TraceColorPicker';
 
 export { TRACE_COLOR_PALETTE };
@@ -29,15 +31,32 @@ export interface LoadedSample {
   color: string;
 }
 
+export interface LoadedRegistryFile {
+  id: string;
+  fileName: string;
+  folderName: string | null;
+  sourceLabel: string;
+  bytes: Uint8Array;
+  parsed: ParsedRegistry;
+  summary: RegistryAnalysisSummary;
+}
+
+export type ExplorerSelectionKind = 'wdf' | 'registry';
+
 interface SidebarProps {
   samples: LoadedSample[];
+  registryFiles: LoadedRegistryFile[];
   selectedId: string | null;
+  selectedRegistryId: string | null;
+  activeSelectionKind: ExplorerSelectionKind;
   onSelectSample: (id: string) => void;
+  onSelectRegistryFile: (id: string) => void;
   onToggleSampleVisible: (id: string) => void;
   onToggleFolderVisible: (folderName: string) => void;
   onSetSamplesVisible: (ids: string[], visible: boolean) => void;
   onUnloadSample: (id: string) => void;
   onUnloadSamples: (ids: string[]) => void;
+  onUnloadRegistryFile: (id: string) => void;
   onUnloadFolder: (folderName: string) => void;
   onSetAllVisible: (visible: boolean) => void;
   onChangeSampleColor: (id: string, color: string) => void;
@@ -48,13 +67,14 @@ interface SidebarProps {
 
 type PendingUnload =
   | { type: 'file'; id: string; label: string }
+  | { type: 'registry'; id: string; label: string }
   | { type: 'folder'; folderName: string; fileCount: number }
   | { type: 'batch'; ids: string[] };
 
 const DEFAULT_SIDEBAR_WIDTH = 320;
 const MIN_SIDEBAR_WIDTH = 256;
 const MAX_SIDEBAR_WIDTH = 680;
-/** Default max height accommodates 8 compact single-line file items (~34px each) before scrolling */
+/** Default max height accommodates ~8 compact single-line file items before scrolling */
 const DEFAULT_MAX_FILES_LIST_HEIGHT = 276;
 const MIN_FILES_LIST_HEIGHT = 72;
 
@@ -65,6 +85,19 @@ function formatTimestamp(iso: string | null): string {
 
 function formatPowerMw(mw: number): string {
   return `${Number(mw.toFixed(2))} mW`;
+}
+
+function formatCalibrationStateLabel(state: RegistryAnalysisSummary['calibration']['state']): string {
+  switch (state) {
+    case 'calibrated':
+      return 'Calibrated';
+    case 'partial':
+      return 'Partial';
+    case 'uncalibrated':
+      return 'Uncalibrated';
+    default:
+      return 'Unknown';
+  }
 }
 
 interface FolderCheckboxProps {
@@ -89,7 +122,7 @@ function FolderCheckbox({ checked, indeterminate, folderName, onChange }: Folder
       type="checkbox"
       checked={checked}
       aria-label={`Show all files in folder ${folderName}`}
-      title={`Tick to show or hide all files in ${folderName}`}
+      title={`Tick to show or hide all spectra in ${folderName}`}
       onClick={(e) => e.stopPropagation()}
       onChange={onChange}
       className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer shrink-0"
@@ -99,13 +132,18 @@ function FolderCheckbox({ checked, indeterminate, folderName, onChange }: Folder
 
 export function Sidebar({
   samples,
+  registryFiles,
   selectedId,
+  selectedRegistryId,
+  activeSelectionKind,
   onSelectSample,
+  onSelectRegistryFile,
   onToggleSampleVisible,
   onToggleFolderVisible,
   onSetSamplesVisible,
   onUnloadSample,
   onUnloadSamples,
+  onUnloadRegistryFile,
   onUnloadFolder,
   onSetAllVisible,
   onChangeSampleColor,
@@ -126,9 +164,12 @@ export function Sidebar({
   const listContainerRef = useRef<HTMLDivElement | null>(null);
 
   const active = samples.find((s) => s.id === selectedId) ?? null;
+  const activeRegistry = registryFiles.find((r) => r.id === selectedRegistryId) ?? null;
+  const showRegistrySummary = activeSelectionKind === 'registry' && activeRegistry !== null;
   const summary = active?.wdf.summary ?? null;
   const visibleCount = samples.filter((s) => s.visible).length;
   const allVisible = samples.length > 0 && visibleCount === samples.length;
+  const totalLoadedCount = samples.length + registryFiles.length;
 
   // Prune any unloaded sample IDs from multi-selection automatically
   const activeMultiSelectedIds = useMemo(() => {
@@ -154,32 +195,53 @@ export function Sidebar({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [pendingUnload, isMultiSelectActive]);
 
-  // Separate ungrouped files from folder-grouped files while preserving order
-  const { ungroupedSamples, folderGroups } = useMemo(() => {
-    const ungrouped: LoadedSample[] = [];
-    const map = new Map<string, LoadedSample[]>();
+  // Separate ungrouped files from folder-grouped files while preserving order (supports both .wdf and .reg/.rrg)
+  const { ungroupedSamples, ungroupedRegistries, folderGroups } = useMemo(() => {
+    const ungroupedWdf: LoadedSample[] = [];
+    const ungroupedReg: LoadedRegistryFile[] = [];
+    const map = new Map<
+      string,
+      { samples: LoadedSample[]; registries: LoadedRegistryFile[] }
+    >();
+
     for (const sample of samples) {
       if (!sample.folderName) {
-        ungrouped.push(sample);
+        ungroupedWdf.push(sample);
       } else {
-        const list = map.get(sample.folderName);
-        if (list) {
-          list.push(sample);
+        const entry = map.get(sample.folderName);
+        if (entry) {
+          entry.samples.push(sample);
         } else {
-          map.set(sample.folderName, [sample]);
+          map.set(sample.folderName, { samples: [sample], registries: [] });
         }
       }
     }
+
+    for (const reg of registryFiles) {
+      if (!reg.folderName) {
+        ungroupedReg.push(reg);
+      } else {
+        const entry = map.get(reg.folderName);
+        if (entry) {
+          entry.registries.push(reg);
+        } else {
+          map.set(reg.folderName, { samples: [], registries: [reg] });
+        }
+      }
+    }
+
     return {
-      ungroupedSamples: ungrouped,
-      folderGroups: Array.from(map.entries()).map(([folderName, items]) => ({
+      ungroupedSamples: ungroupedWdf,
+      ungroupedRegistries: ungroupedReg,
+      folderGroups: Array.from(map.entries()).map(([folderName, group]) => ({
         folderName,
-        items,
+        items: group.samples,
+        registries: group.registries,
       })),
     };
-  }, [samples]);
+  }, [samples, registryFiles]);
 
-  // Visual top-to-bottom order of currently displayed file rows for Shift+Click range selection
+  // Visual top-to-bottom order of currently displayed WDF rows for Shift+Click range selection
   const orderedVisibleFileIds = useMemo(() => {
     const ids: string[] = ungroupedSamples.map((s) => s.id);
     for (const group of folderGroups) {
@@ -253,6 +315,8 @@ export function Sidebar({
     if (pendingUnload.type === 'file') {
       onUnloadSample(pendingUnload.id);
       setMultiSelectedIds((prev) => prev.filter((id) => id !== pendingUnload.id));
+    } else if (pendingUnload.type === 'registry') {
+      onUnloadRegistryFile(pendingUnload.id);
     } else if (pendingUnload.type === 'batch') {
       onUnloadSamples(pendingUnload.ids);
       setMultiSelectedIds([]);
@@ -393,19 +457,67 @@ export function Sidebar({
         { label: 'Captured', value: formatTimestamp(summary.acquisitionStart), mono: true },
         {
           label: 'Hardware IDs',
-          value: [
-            summary.spectrometerSerialNumber ? `Spec ${summary.spectrometerSerialNumber}` : null,
-            summary.ccdSerialNumber ? `CCD ${summary.ccdSerialNumber}` : null,
-          ]
-            .filter(Boolean)
-            .join(' · ') || '—',
+          value:
+            [
+              summary.spectrometerSerialNumber ? `Spec ${summary.spectrometerSerialNumber}` : null,
+              summary.ccdSerialNumber ? `CCD ${summary.ccdSerialNumber}` : null,
+            ]
+              .filter(Boolean)
+              .join(' · ') || '—',
+          mono: true,
+        },
+      ]
+    : [];
+
+  const registrySummaryRows: Array<{ label: string; value: string; mono?: boolean }> = activeRegistry
+    ? [
+        { label: 'File', value: activeRegistry.fileName, mono: true },
+        {
+          label: 'Family',
+          value:
+            activeRegistry.summary.metadata.instrumentFamily === 'unknown'
+              ? 'Unknown'
+              : activeRegistry.summary.metadata.instrumentFamily,
+        },
+        {
+          label: 'Serial',
+          value: activeRegistry.summary.metadata.instrumentSerialNumber ?? '—',
+          mono: true,
+        },
+        {
+          label: 'WiRE',
+          value: activeRegistry.summary.metadata.wireVersion ?? '—',
+          mono: true,
+        },
+        {
+          label: 'Calibration',
+          value: formatCalibrationStateLabel(activeRegistry.summary.calibration.state),
+        },
+        {
+          label: 'Tracks',
+          value: `${activeRegistry.summary.calibration.calibratedTrackCount}/${activeRegistry.summary.calibration.totalTrackCount} calibrated`,
+          mono: true,
+        },
+        {
+          label: 'Hardware',
+          value: `${activeRegistry.summary.lasers.length}L · ${activeRegistry.summary.gratings.length}G · ${activeRegistry.summary.detectors.length}D · ${activeRegistry.summary.motors.length}M`,
+          mono: true,
+        },
+        {
+          label: 'Encoding',
+          value: `${activeRegistry.parsed.encoding} (${activeRegistry.parsed.formatVersion})`,
+          mono: true,
+        },
+        {
+          label: 'Diagnostics',
+          value: `${activeRegistry.parsed.stats.errorCount} err · ${activeRegistry.parsed.stats.warningCount} warn`,
           mono: true,
         },
       ]
     : [];
 
   const renderSampleRow = (sample: LoadedSample) => {
-    const isSelected = sample.id === selectedId;
+    const isSelected = activeSelectionKind === 'wdf' && sample.id === selectedId;
     const isInMultiSelection = isMultiSelectActive && multiSelectedSet.has(sample.id);
     const displayName = stripWdfExtension(sample.fileName);
     return (
@@ -467,6 +579,66 @@ export function Sidebar({
     );
   };
 
+  const renderRegistryRow = (reg: LoadedRegistryFile) => {
+    const isSelected = activeSelectionKind === 'registry' && reg.id === selectedRegistryId;
+    const extMatch = reg.fileName.match(/\.(reg|rrg)$/i);
+    const extLabel = extMatch ? extMatch[1].toUpperCase() : 'REG';
+    return (
+      <div
+        key={reg.id}
+        role="option"
+        data-explorer-registry-id={reg.id}
+        aria-selected={isSelected}
+        onClick={() => {
+          setMultiSelectedIds([]);
+          onSelectRegistryFile(reg.id);
+        }}
+        className={`w-full text-left px-2 py-1 rounded border transition-colors cursor-pointer select-none group/row ${
+          isSelected
+            ? 'bg-blue-50/70 border-blue-600 text-slate-900'
+            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-1.5">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <FileCode2
+              className={`w-3.5 h-3.5 shrink-0 ${
+                isSelected ? 'text-blue-600' : 'text-slate-500'
+              }`}
+              aria-hidden="true"
+            />
+            <span
+              className={`text-xs leading-5 truncate ${
+                isSelected ? 'font-semibold text-slate-900' : 'font-medium text-slate-800'
+              }`}
+              title={reg.fileName}
+            >
+              {reg.fileName}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0">
+            <span className="font-mono text-[10px] font-medium text-slate-500 border border-slate-200 bg-slate-50 px-1 rounded-xs">
+              {extLabel}
+            </span>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPendingUnload({ type: 'registry', id: reg.id, label: reg.fileName });
+              }}
+              aria-label={`Unload ${reg.fileName}`}
+              title={`Unload ${reg.fileName}`}
+              className="p-0.5 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div
       className={`relative flex shrink-0 w-full lg:w-[var(--sidebar-w)] ${
@@ -483,7 +655,8 @@ export function Sidebar({
                 Explorer
               </h2>
               <span className="text-[11px] font-mono tabular-nums text-slate-500 whitespace-nowrap">
-                {visibleCount}/{samples.length} shown
+                {samples.length > 0 ? `${visibleCount}/${samples.length} shown` : '0 spectra'}
+                {registryFiles.length > 0 ? ` · ${registryFiles.length} reg` : ''}
               </span>
             </div>
 
@@ -555,7 +728,7 @@ export function Sidebar({
             </div>
           )}
 
-          {/* Scrollable File & Folder Tree (auto-grows up to 8 files, or user-dragged height) */}
+          {/* Scrollable File & Folder Tree (auto-grows up to ~8 items, or user-dragged height) */}
           <div
             ref={listContainerRef}
             className="space-y-1 overflow-y-auto pr-0.5"
@@ -568,21 +741,25 @@ export function Sidebar({
             aria-multiselectable="true"
             aria-label="Explorer"
           >
-            {samples.length === 0 ? (
+            {totalLoadedCount === 0 ? (
               <div className="py-4 px-3 rounded border border-dashed border-slate-200 bg-slate-50/70 text-center text-xs text-slate-500">
-                No files loaded yet. Open files or a folder below.
+                No files loaded yet. Open .wdf, .reg, or .rrg files below.
               </div>
             ) : (
               <>
-                {/* Standalone / Demo Files */}
+                {/* Standalone / Demo WDF Spectra */}
                 {ungroupedSamples.map((sample) => renderSampleRow(sample))}
 
+                {/* Standalone / Demo Registry Files (.reg / .rrg) */}
+                {ungroupedRegistries.map((reg) => renderRegistryRow(reg))}
+
                 {/* Folder-Grouped Files (collapsed by default) */}
-                {folderGroups.map(({ folderName, items }) => {
+                {folderGroups.map(({ folderName, items, registries }) => {
                   const isExpanded = Boolean(expandedFolders[folderName]);
                   const visibleInFolder = items.filter((item) => item.visible).length;
                   const allInFolderVisible = items.length > 0 && visibleInFolder === items.length;
                   const someInFolderVisible = visibleInFolder > 0 && !allInFolderVisible;
+                  const totalInFolder = items.length + registries.length;
 
                   return (
                     <div
@@ -611,12 +788,14 @@ export function Sidebar({
                             )}
                           </span>
 
-                          <FolderCheckbox
-                            checked={allInFolderVisible}
-                            indeterminate={someInFolderVisible}
-                            folderName={folderName}
-                            onChange={() => onToggleFolderVisible(folderName)}
-                          />
+                          {items.length > 0 && (
+                            <FolderCheckbox
+                              checked={allInFolderVisible}
+                              indeterminate={someInFolderVisible}
+                              folderName={folderName}
+                              onChange={() => onToggleFolderVisible(folderName)}
+                            />
+                          )}
 
                           {isExpanded ? (
                             <FolderOpen className="w-3.5 h-3.5 text-blue-600 shrink-0" aria-hidden="true" />
@@ -634,7 +813,11 @@ export function Sidebar({
 
                         <div className="flex items-center gap-1 shrink-0">
                           <span className="text-[11px] font-mono tabular-nums text-slate-500 whitespace-nowrap">
-                            {visibleInFolder}/{items.length}
+                            {items.length > 0 && registries.length > 0
+                              ? `${visibleInFolder}/${items.length} · ${registries.length} reg`
+                              : items.length > 0
+                                ? `${visibleInFolder}/${items.length}`
+                                : `${registries.length} reg`}
                           </span>
                           <button
                             type="button"
@@ -643,7 +826,7 @@ export function Sidebar({
                               setPendingUnload({
                                 type: 'folder',
                                 folderName,
-                                fileCount: items.length,
+                                fileCount: totalInFolder,
                               });
                             }}
                             aria-label={`Unload folder ${folderName}`}
@@ -658,6 +841,7 @@ export function Sidebar({
                       {isExpanded && (
                         <div className="px-1.5 py-1 space-y-1 bg-white border-t border-slate-200/80">
                           {items.map((sample) => renderSampleRow(sample))}
+                          {registries.map((reg) => renderRegistryRow(reg))}
                         </div>
                       )}
                     </div>
@@ -677,6 +861,7 @@ export function Sidebar({
                   ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
                   : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
               }`}
+              title="Open Renishaw .wdf spectra or .reg / .rrg registry files"
             >
               <Upload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
               <span>Open Files</span>
@@ -690,7 +875,7 @@ export function Sidebar({
                   ? 'border-blue-600 bg-blue-50 text-blue-700 font-medium'
                   : 'border-slate-300 bg-slate-50 text-slate-700 hover:border-slate-400 hover:text-slate-900'
               }`}
-              title="Select a folder and load all Renishaw .wdf files inside it and its subfolders"
+              title="Select a folder and load all Renishaw .wdf spectra and .reg / .rrg registry files inside it"
             >
               <FolderOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
               <span>Open Folder</span>
@@ -734,16 +919,36 @@ export function Sidebar({
               )}
               <span>Summary</span>
             </span>
-            {active && (
+            {showRegistrySummary && activeRegistry ? (
+              <span className="text-[11px] font-mono tabular-nums text-slate-500">
+                {activeRegistry.parsed.stats.sectionCount.toLocaleString()} keys
+              </span>
+            ) : active ? (
               <span className="text-[11px] font-mono tabular-nums text-slate-500">
                 {active.wdf.blocks.length} blocks
               </span>
-            )}
+            ) : null}
           </button>
 
           {summaryExpanded && (
             <div className="px-3 pb-3">
-              {summary ? (
+              {showRegistrySummary && activeRegistry ? (
+                <dl className="divide-y divide-slate-100 text-xs">
+                  {registrySummaryRows.map((row) => (
+                    <div key={row.label} className="py-1.5 flex items-baseline justify-between gap-3">
+                      <dt className="text-slate-500 shrink-0">{row.label}</dt>
+                      <dd
+                        className={`text-slate-900 text-right truncate ${
+                          row.mono ? 'font-mono tabular-nums text-[11px]' : 'font-medium'
+                        }`}
+                        title={row.value}
+                      >
+                        {row.value}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : summary ? (
                 <dl className="divide-y divide-slate-100 text-xs">
                   {summaryRows.map((row) => {
                     if (row.label === 'Laser') {
@@ -867,7 +1072,9 @@ export function Sidebar({
                   ? 'Unload Folder'
                   : pendingUnload.type === 'batch'
                     ? 'Unload Selected Files'
-                    : 'Unload File'}
+                    : pendingUnload.type === 'registry'
+                      ? 'Unload Registry File'
+                      : 'Unload File'}
               </h3>
               <button
                 type="button"

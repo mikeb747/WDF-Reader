@@ -3,13 +3,26 @@ import { AlertCircle, FolderOpen, Upload, X } from 'lucide-react';
 import { BlockMapView } from './components/BlockMapView';
 import { InstrumentView } from './components/InstrumentView';
 import { OfflineIndicator } from './components/PWAInstallButton';
-import { Sidebar, TRACE_COLOR_PALETTE, type LoadedSample } from './components/Sidebar';
+import { RegistryView } from './components/RegistryView';
+import {
+  Sidebar,
+  TRACE_COLOR_PALETTE,
+  type ExplorerSelectionKind,
+  type LoadedRegistryFile,
+  type LoadedSample,
+} from './components/Sidebar';
 import { SpectrumView, type BaselineStrength, type SmoothStrength } from './components/SpectrumView';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { TypeScriptExportView } from './components/TypeScriptExportView';
 import { stripWdfExtension } from './lib/format';
 import { parseWdf, type SpectralTargetUnit, type WdfFile } from './lib/wdf';
 import { buildStandaloneWdfReaderTs } from './lib/wdf/exportModule';
+import {
+  parseRegistry,
+  summarizeRegistry,
+  type ParsedRegistry,
+  type RegistryAnalysisSummary,
+} from './registry';
 
 const BASE_URL = import.meta.env.BASE_URL || '/';
 const IS_PWA_BUILD = import.meta.env.VITE_PWA_BUILD === 'true';
@@ -24,6 +37,24 @@ const BUNDLED_SAMPLES: Array<{ id: string; fileName: string; url: string }> = [
     id: 'sample-pcl-17087',
     fileName: '532nm_1800_17087 abs cm-1_PCL.wdf',
     url: `${BASE_URL}assets/aistudio/532nm_1800_17087_abs_cm-1_PCL_e8762f36.txt`,
+  },
+];
+
+const BUNDLED_REGISTRIES: Array<{ id: string; fileName: string; url: string }> = [
+  {
+    id: 'reg-virsa-aj4f17',
+    fileName: 'AJ4F17_20250813_sys.rrg',
+    url: `${BASE_URL}assets/aistudio/AJ4F17_20250813_sys_47160748.txt`,
+  },
+  {
+    id: 'reg-invia-anj351',
+    fileName: 'ANJ351_AGENZIA_inVia.reg',
+    url: `${BASE_URL}assets/aistudio/ANJ351_AGENZIA_inVia_7988e490.txt`,
+  },
+  {
+    id: 'reg-invia-f8ue48',
+    fileName: 'F8UE48_20260407_sys.reg',
+    url: `${BASE_URL}assets/aistudio/F8UE48_20260407_sys_719b89e1.txt`,
   },
 ];
 
@@ -149,9 +180,67 @@ function hasWdf1Magic(bytes: Uint8Array): boolean {
   );
 }
 
+function isRegistryFileName(fileName: string): boolean {
+  return /\.(reg|rrg)$/i.test(fileName);
+}
+
+/**
+ * Lightweight header check so renamed `.txt` Windows Registry exports (UTF-16LE/BE or UTF-8)
+ * are recognized as registry files when opened directly, without decoding the full buffer twice.
+ */
+function hasRegistryHeaderSignature(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 8) return false;
+  const sampleLen = Math.min(bytes.byteLength, 128);
+  const slice = bytes.subarray(0, sampleLen);
+
+  let prefixText = '';
+  if (slice[0] === 0xff && slice[1] === 0xfe) {
+    // UTF-16LE with BOM
+    const chars: string[] = [];
+    for (let i = 2; i + 1 < slice.length; i += 2) {
+      chars.push(String.fromCharCode(slice[i] | (slice[i + 1] << 8)));
+    }
+    prefixText = chars.join('');
+  } else if (slice[0] === 0xfe && slice[1] === 0xff) {
+    // UTF-16BE with BOM
+    const chars: string[] = [];
+    for (let i = 2; i + 1 < slice.length; i += 2) {
+      chars.push(String.fromCharCode((slice[i] << 8) | slice[i + 1]));
+    }
+    prefixText = chars.join('');
+  } else {
+    const start =
+      slice.length >= 3 && slice[0] === 0xef && slice[1] === 0xbb && slice[2] === 0xbf ? 3 : 0;
+    const chars: string[] = [];
+    for (let i = start; i < slice.length; i++) {
+      if (slice[i] !== 0) chars.push(String.fromCharCode(slice[i]));
+    }
+    prefixText = chars.join('');
+  }
+
+  const trimmed = prefixText.trimStart();
+  return (
+    /^Windows Registry Editor Version\s+\d/i.test(trimmed) ||
+    /^REGEDIT4\b/i.test(trimmed) ||
+    /^\[HKEY_/i.test(trimmed)
+  );
+}
+
+function parseRegistryBytes(
+  bytes: Uint8Array,
+  sourceName: string,
+): { parsed: ParsedRegistry; summary: RegistryAnalysisSummary } {
+  const parsed = parseRegistry(bytes, { sourceName });
+  const summary = summarizeRegistry(parsed);
+  return { parsed, summary };
+}
+
 export default function App() {
   const [samples, setSamples] = useState<LoadedSample[]>([]);
+  const [registryFiles, setRegistryFiles] = useState<LoadedRegistryFile[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedRegistryId, setSelectedRegistryId] = useState<string | null>(null);
+  const [explorerSelectionKind, setExplorerSelectionKind] = useState<ExplorerSelectionKind>('wdf');
   const [activeTab, setActiveTab] = useState<ActiveTab>('spectrum');
   const [targetUnit, setTargetUnit] = useState<SpectralTargetUnit>('native');
   const [baselineEnabled, setBaselineEnabled] = useState(false);
@@ -163,6 +252,7 @@ export default function App() {
   const [isLoadingSamples, setIsLoadingSamples] = useState(!IS_PWA_BUILD);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const registryFileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const nextColorIndexRef = useRef<number>(0);
 
@@ -172,7 +262,7 @@ export default function App() {
     return color;
   }, []);
 
-  // Load both bundled Renishaw demo files only in AI Studio demo mode (excluded in GitHub PWA builds)
+  // Load bundled Renishaw demo files only in AI Studio demo mode (excluded in GitHub PWA builds)
   useEffect(() => {
     if (IS_PWA_BUILD) {
       setIsLoadingSamples(false);
@@ -204,11 +294,38 @@ export default function App() {
           console.error(`Failed to parse bundled sample ${spec.fileName}:`, err);
         }
       }
+
+      const loadedRegs: LoadedRegistryFile[] = [];
+      for (const spec of BUNDLED_REGISTRIES) {
+        try {
+          const res = await fetch(spec.url);
+          if (!res.ok) continue;
+          const buf = await res.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          const { parsed, summary } = parseRegistryBytes(bytes, spec.fileName);
+          loadedRegs.push({
+            id: spec.id,
+            fileName: spec.fileName,
+            folderName: null,
+            sourceLabel: 'Demo registry',
+            bytes,
+            parsed,
+            summary,
+          });
+        } catch (err) {
+          console.error(`Failed to parse bundled registry ${spec.fileName}:`, err);
+        }
+      }
+
       if (!cancelled) {
         nextColorIndexRef.current = loaded.length;
         setSamples(loaded);
+        setRegistryFiles(loadedRegs);
         if (loaded.length > 0) {
           setSelectedId(loaded[0].id);
+        }
+        if (loadedRegs.length > 0) {
+          setSelectedRegistryId(loadedRegs[0].id);
         }
         setIsLoadingSamples(false);
       }
@@ -220,10 +337,11 @@ export default function App() {
   }, []);
 
   const ingestFiles = useCallback(
-    async (incoming: IncomingFile[], isDirectoryBatch = false) => {
+    async (incoming: IncomingFile[], isDirectoryBatch = false, forceRegistryMode = false) => {
       if (incoming.length === 0) return;
       setErrorMessage(null);
       const newlyLoaded: LoadedSample[] = [];
+      const newlyLoadedRegistries: LoadedRegistryFile[] = [];
       const errors: string[] = [];
 
       // Sort by folder path, then file name for predictable folder grouping
@@ -236,11 +354,34 @@ export default function App() {
       for (const { file, folderName } of ordered) {
         if (file.name.startsWith('.')) continue;
         try {
+          // Always read raw binary bytes via file.arrayBuffer() so UTF-16LE/BE BOMs and WDF1 binaries stay intact
           const buf = await file.arrayBuffer();
           const bytes = new Uint8Array(buf);
+          const isWdf = hasWdf1Magic(bytes);
+          const isReg =
+            forceRegistryMode ||
+            isRegistryFileName(file.name) ||
+            (!isWdf && hasRegistryHeaderSignature(bytes));
 
-          // In directory mode, quietly skip non-WDF auxiliary files (images, hidden OS files, etc.)
-          if (isDirectoryBatch && !hasWdf1Magic(bytes)) {
+          if (isReg && !isWdf) {
+            const { parsed, summary } = parseRegistryBytes(bytes, file.name);
+            const resolvedFolder = isDirectoryBatch
+              ? folderName || 'Imported Folder'
+              : null;
+            newlyLoadedRegistries.push({
+              id: `reg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              fileName: file.name,
+              folderName: resolvedFolder,
+              sourceLabel: isDirectoryBatch ? 'Folder import' : 'Uploaded registry',
+              bytes,
+              parsed,
+              summary,
+            });
+            continue;
+          }
+
+          // In directory mode, quietly skip non-WDF and non-registry auxiliary files
+          if (isDirectoryBatch && !isWdf) {
             if (file.name.toLowerCase().endsWith('.wdf')) {
               errors.push(`${stripWdfExtension(file.name)}: Invalid WDF1 header signature`);
             }
@@ -286,9 +427,29 @@ export default function App() {
         setSelectedId((prevSelected) => prevSelected ?? newlyLoaded[0].id);
         if (!isDirectoryBatch) {
           setSelectedId(newlyLoaded[0].id);
+          setExplorerSelectionKind('wdf');
         }
-      } else if (isDirectoryBatch && errors.length === 0) {
-        setErrorMessage('No valid Renishaw .wdf files (WDF1 signature) were found in the selected folder.');
+      }
+
+      if (newlyLoadedRegistries.length > 0) {
+        setRegistryFiles((prev) =>
+          isDirectoryBatch ? [...prev, ...newlyLoadedRegistries] : [...newlyLoadedRegistries, ...prev],
+        );
+        setSelectedRegistryId((prevSelected) =>
+          !isDirectoryBatch || !prevSelected ? newlyLoadedRegistries[0].id : prevSelected,
+        );
+        if (!isDirectoryBatch && newlyLoaded.length === 0) {
+          setSelectedRegistryId(newlyLoadedRegistries[0].id);
+          setExplorerSelectionKind('registry');
+          setActiveTab('registry');
+          setIsFullscreen(false);
+        }
+      }
+
+      if (newlyLoaded.length === 0 && newlyLoadedRegistries.length === 0 && isDirectoryBatch && errors.length === 0) {
+        setErrorMessage(
+          'No valid Renishaw .wdf spectra or registry (.reg, .rrg) files were found in the selected folder.',
+        );
       }
 
       if (errors.length > 0) {
@@ -299,9 +460,12 @@ export default function App() {
   );
 
   const activeSample = samples.find((s) => s.id === selectedId) ?? samples[0] ?? null;
+  const activeRegistryFile =
+    registryFiles.find((r) => r.id === selectedRegistryId) ?? registryFiles[0] ?? null;
 
   const handleSelectSample = (id: string) => {
     setSelectedId(id);
+    setExplorerSelectionKind('wdf');
     setSamples((prev) => {
       const visibleList = prev.filter((s) => s.visible);
       if (visibleList.length <= 1) {
@@ -309,6 +473,17 @@ export default function App() {
       }
       return prev.map((s) => (s.id === id ? { ...s, visible: true } : s));
     });
+    if (activeTab === 'registry') {
+      setActiveTab('spectrum');
+    }
+    setErrorMessage(null);
+  };
+
+  const handleSelectRegistryFile = (id: string) => {
+    setSelectedRegistryId(id);
+    setExplorerSelectionKind('registry');
+    setActiveTab('registry');
+    setIsFullscreen(false);
     setErrorMessage(null);
   };
 
@@ -335,6 +510,7 @@ export default function App() {
 
     if (turningOn && firstInFolderId) {
       setSelectedId(firstInFolderId);
+      setExplorerSelectionKind('wdf');
     }
   };
 
@@ -360,6 +536,19 @@ export default function App() {
     });
   };
 
+  const handleUnloadRegistryFile = (id: string) => {
+    setRegistryFiles((prev) => {
+      const remaining = prev.filter((r) => r.id !== id);
+      if (selectedRegistryId === id) {
+        setSelectedRegistryId(remaining[0]?.id ?? null);
+      }
+      if (remaining.length === 0 && explorerSelectionKind === 'registry' && samples.length > 0) {
+        setExplorerSelectionKind('wdf');
+      }
+      return remaining;
+    });
+  };
+
   const handleSetSamplesVisible = (ids: string[], visible: boolean) => {
     if (ids.length === 0) return;
     const idSet = new Set(ids);
@@ -376,6 +565,13 @@ export default function App() {
       const remaining = prev.filter((s) => s.folderName !== folderName);
       if (selectedId && !remaining.some((s) => s.id === selectedId)) {
         setSelectedId(remaining[0]?.id ?? null);
+      }
+      return remaining;
+    });
+    setRegistryFiles((prev) => {
+      const remaining = prev.filter((r) => r.folderName !== folderName);
+      if (selectedRegistryId && !remaining.some((r) => r.id === selectedRegistryId)) {
+        setSelectedRegistryId(remaining[0]?.id ?? null);
       }
       return remaining;
     });
@@ -416,6 +612,7 @@ export default function App() {
         return [newSample, ...prev];
       });
       setSelectedId(id);
+      setExplorerSelectionKind('wdf');
       setErrorMessage(null);
     },
     [allocateColor],
@@ -450,6 +647,11 @@ export default function App() {
     if (tab !== 'spectrum') {
       setIsFullscreen(false);
     }
+    if (tab === 'registry' && registryFiles.length > 0) {
+      setExplorerSelectionKind('registry');
+    } else if (tab !== 'registry' && samples.length > 0) {
+      setExplorerSelectionKind('wdf');
+    }
   };
 
   return (
@@ -471,14 +673,14 @@ export default function App() {
         })();
       }}
     >
-      {/* Standard Multi-File Picker */}
+      {/* Standard Multi-File Picker (.wdf spectra and .reg / .rrg registry exports) */}
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".wdf,.txt,*/*"
+        accept=".wdf,.reg,.rrg,.txt,*/*"
         className="hidden"
-        aria-label="Upload Renishaw WDF file"
+        aria-label="Upload Renishaw WDF or Registry file"
         onChange={(e) => {
           const files = e.target.files
             ? Array.from(e.target.files).map((file) => ({ file, folderName: null }))
@@ -488,7 +690,24 @@ export default function App() {
         }}
       />
 
-      {/* Directory Picker (loads all .wdf files in the chosen folder & subfolders) */}
+      {/* Dedicated Registry File Picker (.reg / .rrg) */}
+      <input
+        ref={registryFileInputRef}
+        type="file"
+        multiple
+        accept=".reg,.rrg"
+        className="hidden"
+        aria-label="Upload Windows or Renishaw WiRE Registry file"
+        onChange={(e) => {
+          const files = e.target.files
+            ? Array.from(e.target.files).map((file) => ({ file, folderName: null }))
+            : [];
+          void ingestFiles(files, false, true);
+          e.target.value = '';
+        }}
+      />
+
+      {/* Directory Picker (loads .wdf spectra and .reg / .rrg registry files in the chosen folder & subfolders) */}
       <input
         ref={folderInputRef}
         type="file"
@@ -497,7 +716,7 @@ export default function App() {
         webkitdirectory=""
         directory=""
         className="hidden"
-        aria-label="Upload Renishaw WDF folder"
+        aria-label="Upload Renishaw WDF or Registry folder"
         onChange={(e) => {
           const files = e.target.files
             ? Array.from(e.target.files).map((file) => ({
@@ -540,13 +759,18 @@ export default function App() {
         {!showChartFullscreen && (
           <Sidebar
             samples={samples}
+            registryFiles={registryFiles}
             selectedId={activeSample?.id ?? null}
+            selectedRegistryId={activeRegistryFile?.id ?? null}
+            activeSelectionKind={explorerSelectionKind}
             onSelectSample={handleSelectSample}
+            onSelectRegistryFile={handleSelectRegistryFile}
             onToggleSampleVisible={handleToggleSampleVisible}
             onToggleFolderVisible={handleToggleFolderVisible}
             onSetSamplesVisible={handleSetSamplesVisible}
             onUnloadSample={handleUnloadSample}
             onUnloadSamples={handleUnloadSamples}
+            onUnloadRegistryFile={handleUnloadRegistryFile}
             onUnloadFolder={handleUnloadFolder}
             onSetAllVisible={handleSetAllVisible}
             onChangeSampleColor={handleChangeSampleColor}
@@ -563,17 +787,34 @@ export default function App() {
         >
           {isLoadingSamples ? (
             <div className="p-8 text-sm text-slate-500 font-mono">
-              Loading bundled Renishaw demo spectra…
+              Loading bundled Renishaw demo files…
             </div>
+          ) : effectiveTab === 'registry' ? (
+            <RegistryView
+              samples={samples}
+              activeSampleId={activeSample?.id ?? null}
+              registryFiles={registryFiles}
+              activeRegistryId={activeRegistryFile?.id ?? null}
+              onSelectRegistryFile={handleSelectRegistryFile}
+              onOpenRegistryFileClick={() => registryFileInputRef.current?.click()}
+              onSelectSampleInSpectrum={(id) => {
+                handleSelectSample(id);
+                setActiveTab('spectrum');
+              }}
+            />
+          ) : effectiveTab === 'export' ? (
+            <TypeScriptExportView onDownloadTsModule={handleDownloadTsModule} />
           ) : !activeSample ? (
             <div className="p-8 max-w-xl mx-auto mt-8">
               <div className="bg-white border border-slate-200 rounded p-8 text-center space-y-4">
                 <div className="space-y-1.5">
                   <h1 className="text-base font-semibold text-slate-900">
-                    Open Renishaw Raman Spectra
+                    Open Renishaw Spectra or Registry Exports
                   </h1>
                   <p className="text-xs text-slate-500">
-                    Load individual <span className="font-mono">.wdf</span> files, open a folder with subfolders, or drag and drop files anywhere onto this window.
+                    Load <span className="font-mono">.wdf</span> Raman spectra,{' '}
+                    <span className="font-mono">.reg</span> / <span className="font-mono">.rrg</span>{' '}
+                    WiRE registry exports, open a folder with subfolders, or drag and drop files anywhere onto this window.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-center gap-2.5">
@@ -621,10 +862,8 @@ export default function App() {
             />
           ) : effectiveTab === 'instrument' ? (
             <InstrumentView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
-          ) : effectiveTab === 'blocks' ? (
-            <BlockMapView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
           ) : (
-            <TypeScriptExportView onDownloadTsModule={handleDownloadTsModule} />
+            <BlockMapView wdf={activeSample.wdf} rawBytes={activeSample.bytes} />
           )}
         </main>
       </div>
