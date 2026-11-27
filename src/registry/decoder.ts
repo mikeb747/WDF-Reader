@@ -135,6 +135,26 @@ export function decodeRegistryInput(input: RegistryInput): DecodedRegistrySource
     };
   }
 
+  // Some text-mode transports / Git filters replace the 2-byte UTF-16LE BOM (FF FE)
+  // with two UTF-8 U+FFFD replacement sequences (EF BF BD EF BF BD) while preserving
+  // the remaining UTF-16LE payload intact.
+  if (
+    byteLength >= 10 &&
+    bytes[0] === 0xef &&
+    bytes[1] === 0xbf &&
+    bytes[2] === 0xbd &&
+    bytes[3] === 0xef &&
+    bytes[4] === 0xbf &&
+    bytes[5] === 0xbd &&
+    looksLikeUtf16LeWithoutBom(bytes.subarray(6))
+  ) {
+    return {
+      text: decodeUtf16Bytes(bytes, true, 6),
+      encoding: 'utf-16le-bom',
+      byteLength,
+    };
+  }
+
   if (byteLength >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
     return {
       text: decodeUtf16Bytes(bytes, false, 2),

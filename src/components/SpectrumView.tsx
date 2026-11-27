@@ -8,6 +8,7 @@ import {
   fitPeakCurve,
   getSpectrum,
   interpolateAxisAtPixel,
+  isSpatialMap2D,
   samplePeakCurve,
   smoothSpectrumSavitzkyGolay,
   subtractBaseline,
@@ -23,6 +24,7 @@ import {
 import { stripWdfExtension } from '../lib/format';
 import { DataArithmeticModal } from './DataArithmeticModal';
 import { ScanMapChart, type ActiveIntegrationWindow } from './ScanMapChart';
+import { SpatialMapOverlay } from './SpatialMapOverlay';
 import type { LoadedSample } from './Sidebar';
 import { TraceColorPicker } from './TraceColorPicker';
 
@@ -1289,25 +1291,7 @@ export function SpectrumView({
     };
   }, [integrationWindow, isMultiOverlay, wdf, effectiveUnit, viewDomain.xMin, viewDomain.xMax]);
 
-  const mapGrid = useMemo(() => {
-    if (!wdf.mapArea || totalSpectra <= 1) return null;
-    const cols = Math.max(1, wdf.mapArea.count.x);
-    const rows = Math.max(1, wdf.mapArea.count.y);
-    const cells: number[] = [];
-    let minVal = Infinity;
-    let maxVal = -Infinity;
-    for (let i = 0; i < Math.min(totalSpectra, cols * rows); i++) {
-      const spec = getSpectrum(wdf, i);
-      let peak = 0;
-      for (let j = 0; j < spec.length; j++) {
-        if (spec[j] > peak) peak = spec[j];
-      }
-      cells.push(peak);
-      if (peak < minVal) minVal = peak;
-      if (peak > maxVal) maxVal = peak;
-    }
-    return { cols, rows, cells, minVal, maxVal };
-  }, [wdf, totalSpectra]);
+  const has2dSpatialMap = useMemo(() => isSpatialMap2D(wdf), [wdf]);
 
   const combinedPeaks = useMemo(() => {
     const rows: Array<{ trace: ComputedTrace; peak: WdfPeak }> = [];
@@ -2752,8 +2736,22 @@ export function SpectrumView({
         </div>
       </div>
 
-      {/* Scan Integration / Map Plot (multi-scan series or embedded Renishaw MAP block) */}
-      {!isFullscreen && !isMultiOverlay && (wdf.maps.length > 0 || totalSpectra > 1) && (
+      {/* 2D Raman Spatial Map + White-Light Optical Overlay */}
+      {!isFullscreen && !isMultiOverlay && has2dSpatialMap && (
+        <SpatialMapOverlay
+          wdf={wdf}
+          fileName={fileName}
+          whiteLightUrl={whiteLightUrl}
+          spectrumIndex={spectrumIndex}
+          totalSpectra={totalSpectra}
+          targetUnit={effectiveUnit}
+          onSelectSpectrum={setSpectrumIndex}
+          onIntegrationWindowChange={setIntegrationWindow}
+        />
+      )}
+
+      {/* 1D Scan Integration / Series Plot (multi-scan 1D series or non-2D embedded MAP block) */}
+      {!isFullscreen && !isMultiOverlay && !has2dSpatialMap && (wdf.maps.length > 0 || totalSpectra > 1) && (
         <ScanMapChart
           wdf={wdf}
           fileName={fileName}
@@ -2786,37 +2784,6 @@ export function SpectrumView({
               className="w-full accent-blue-600"
             />
           </div>
-
-          {mapGrid && (
-            <div className="shrink-0">
-              <div className="text-[11px] font-medium text-slate-500 mb-1">
-                2D Map Intensity ({mapGrid.cols} × {mapGrid.rows})
-              </div>
-              <div
-                className="grid gap-0.5 border border-slate-200 p-0.5 bg-slate-100"
-                style={{ gridTemplateColumns: `repeat(${mapGrid.cols}, 20px)` }}
-              >
-                {mapGrid.cells.map((val, idx) => {
-                  const norm =
-                    mapGrid.maxVal > mapGrid.minVal
-                      ? (val - mapGrid.minVal) / (mapGrid.maxVal - mapGrid.minVal)
-                      : 0.5;
-                  return (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => setSpectrumIndex(idx)}
-                      title={`Spectrum #${idx + 1}: peak ${val.toFixed(1)}`}
-                      className={`w-5 h-5 cursor-pointer ${idx === spectrumIndex ? 'ring-2 ring-slate-900' : ''}`}
-                      style={{
-                        backgroundColor: `rgba(37, 99, 235, ${(0.15 + norm * 0.85).toFixed(2)})`,
-                      }}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          )}
         </div>
       )}
 
@@ -3042,9 +3009,9 @@ export function SpectrumView({
             </section>
           )}
 
-          {/* Detected Peaks Table + Optional White-Light Image */}
+          {/* Detected Peaks Table + Optional Standalone White-Light Image (for non-2D spectra) */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <div className={`${whiteLightUrl && !isMultiOverlay ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
+        <div className={`${whiteLightUrl && !isMultiOverlay && !has2dSpatialMap ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white border border-slate-200 rounded`}>
           <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
             <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
               Detected Local Maxima ({combinedPeaks.length})
@@ -3117,7 +3084,7 @@ export function SpectrumView({
           )}
         </div>
 
-        {whiteLightUrl && !isMultiOverlay && wdf.whiteLightImage && (
+        {whiteLightUrl && !isMultiOverlay && !has2dSpatialMap && wdf.whiteLightImage && (
           <div className="bg-white border border-slate-200 rounded overflow-hidden">
             <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
               <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wider">

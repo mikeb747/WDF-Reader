@@ -38,6 +38,11 @@ const BUNDLED_SAMPLES: Array<{ id: string; fileName: string; url: string }> = [
     fileName: '532nm_1800_17087 abs cm-1_PCL.wdf',
     url: `${BASE_URL}assets/aistudio/532nm_1800_17087_abs_cm-1_PCL_e8762f36.txt`,
   },
+  {
+    id: 'sample-streamline-2d',
+    fileName: '532nm_1800_StreamLine_image_acquisition.wdf',
+    url: `${BASE_URL}assets/aistudio/532nm_1800_StreamLine_image_acquisition_fba7f15f.txt`,
+  },
 ];
 
 const BUNDLED_REGISTRIES: Array<{ id: string; fileName: string; url: string }> = [

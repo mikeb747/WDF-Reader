@@ -45,3 +45,17 @@ export {
   type PeakWidthBaselineEstimate,
   type SampledCurvePoint,
 } from './curveFit';
+export {
+  parseWhiteLightExif,
+  isSpatialMap2D,
+  buildSpatialGrid2D,
+  sampleColormapRgb,
+  getColormapCssGradient,
+  MAP_COLORMAPS,
+  type WhiteLightSpatialMeta,
+  type SpatialCell2D,
+  type SpatialGrid2D,
+  type MapColormapId,
+  type MapColormapDef,
+} from './spatialMap';
+
